@@ -3317,8 +3317,12 @@ static int vulkan_frames_init(AVHWFramesContext *hwfc)
          * output) cannot support host transfers: decode submissions bake the
          * image layout into their barriers at record time, so a host-side
          * layout transition cannot be synchronized against them, not even
-         * by the frame lock and timeline semaphore. */
+         * by the frame lock and timeline semaphore.
+         * Multiplane is disabled on devices meant for CUDA interop, and CUDA
+         * cannot map images with host transfer usage (NVIDIA, Windows:
+         * cuExternalMemoryGetMappedMipmappedArray fails), so skip it there. */
         if (p->vkctx.extensions & FF_VK_EXT_HOST_IMAGE_COPY &&
+            !p->disable_multiplane &&
             !(hwctx->usage & VK_IMAGE_USAGE_VIDEO_DECODE_DPB_BIT_KHR))
             hwctx->usage |= supported_usage & VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
 
