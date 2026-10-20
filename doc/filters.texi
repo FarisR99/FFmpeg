@@ -28132,6 +28132,56 @@ Preserve landscape geometry (when @var{width} >= @var{height}).
 
 @end table
 
+@section truehdr_cuda
+
+Convert SDR video to HDR10 with NVIDIA RTX Video TrueHDR, an AI based SDR to
+HDR conversion.
+
+The input must be CUDA frames in @code{rgba} or @code{rgb0} format, with an
+even size, and SDR. BT.709 primaries are assumed unless the input is tagged
+BT.2020. The output is limited range BT.2020 PQ in CUDA @code{p010} frames,
+which can be encoded directly, e.g. by @code{hevc_nvenc} with
+@code{-profile:v main10}.
+
+This filter requires Windows and an NVIDIA RTX GPU. The RTX Video SDK is not
+linked; it is loaded at runtime through @file{NVEncNVSDKNGX.dll}, which needs
+@file{nvngx_truehdr.dll} and @file{cudart64_12.dll}. Place all three next to
+the executable.
+
+It accepts the following parameters:
+
+@table @option
+@item contrast
+Difference between lights and darks, from 0 to 200. Default is 125.
+
+@item saturation
+Color intensity, from 0 to 200. Default is 75.
+
+@item middle_gray
+Average brightness, from 10 to 100. Default is 44.
+
+@item max_luma
+Peak brightness in nits, from 400 to 2000. Default is 1000.
+
+@item metadata
+Attach HDR10 mastering display (BT.2020 primaries, D65, @var{max_luma} peak)
+and content light level (MaxCLL = @var{max_luma}) metadata. Default is
+enabled.
+@end table
+
+Settings quoted for NVIDIA's RTX HDR driver feature use -100 to 100 for
+contrast and saturation; add 100 to those values here.
+
+@subsection Example
+
+Upscale with a libplacebo shader, then convert to HDR10 and encode:
+@example
+ffmpeg -init_hw_device vulkan=vk:0,disable_multiplane=1 -filter_hw_device vk \
+  -hwaccel vulkan -hwaccel_output_format vulkan -i INPUT \
+  -vf "libplacebo=w=3840:h=2160:format=rgba:custom_shader_path=shader.glsl,hwupload=derive_device=cuda,truehdr_cuda" \
+  -c:v hevc_nvenc -profile:v main10 OUTPUT
+@end example
+
 @section yadif_cuda
 
 Deinterlace the input video using the @ref{yadif} algorithm, but implemented
