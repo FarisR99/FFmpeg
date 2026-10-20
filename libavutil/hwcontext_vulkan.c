@@ -2667,6 +2667,14 @@ static int switch_layout(AVHWFramesContext *hwfc, FFVkExecPool *ectx,
     if (err < 0)
         return err;
 
+    /* External users (CUDA, DMA-BUF) synchronize on the frame's semaphores,
+     * which the submission above already advanced, so waiting here would
+     * only stall the CPU until the GPU has finished the frame. The stack-based
+     * frame stays in the dependency list until the context is reused, but
+     * it was unlocked on submission, so it is never dereferenced again. */
+    if (pmode == PREP_MODE_EXTERNAL_EXPORT || pmode == PREP_MODE_EXTERNAL_IMPORT)
+        return 0;
+
     /* Drops the stack-based frame above from the dependency list */
     ff_vk_exec_wait(&p->vkctx, exec);
 
