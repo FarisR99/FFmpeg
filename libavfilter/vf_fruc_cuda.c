@@ -29,6 +29,10 @@
  * instance yields one frame per input pair. Rates above twice the input use
  * one instance per output position within a pair; an instance that skipped
  * a pair is restarted from the pair's first frame.
+ *
+ * NvOFFRUC's process call blocks until the frame is done, so it runs on a
+ * worker thread: meanwhile the filter fetches the next input, which lets the
+ * filters before it (and mpv's renderer) prepare that frame.
  */
 
 #include <stdbool.h>
@@ -45,6 +49,7 @@
 #include "libavutil/mem.h"
 #include "libavutil/opt.h"
 #include "libavutil/pixdesc.h"
+#include "libavutil/thread.h"
 
 #include "avfilter.h"
 #include "filters.h"
@@ -120,6 +125,26 @@ typedef struct FRUCCUDAContext {
     int nb_inst;
     int pair_idx;       ///< interpolated frames already made from this pair
 
+    /* Worker thread running one interpolation (a job) at a time. */
+    pthread_t worker;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    int worker_started;
+    int quit;
+    int job_running;    ///< set by the filter, cleared by the worker
+    int job_err;
+    FRUCInstance *job_inst;
+    int job_restart;    ///< restart the instance from buf[job_buf_f0] first
+    int job_buf_f0;
+    int64_t job_pts0;
+    FRUCProcParams job_params;
+    AVFrame *pending;   ///< output frame the running or finished job fills
+
+    AVFrame *next;      ///< input fetched while a job runs, not yet used
+    int eof;
+    int eof_status;
+    int64_t eof_pts;
+
     AVFrame *work;
     AVFrame *f0;        ///< last frame
     AVFrame *f1;        ///< current frame
@@ -155,6 +180,21 @@ static av_cold void fruc_free_instances(AVFilterContext *ctx)
 static av_cold void fruc_uninit(AVFilterContext *ctx)
 {
     FRUCCUDAContext *s = ctx->priv;
+
+    if (s->worker_started) {
+        pthread_mutex_lock(&s->lock);
+        s->quit = 1;
+        pthread_cond_broadcast(&s->cond);
+        pthread_mutex_unlock(&s->lock);
+        pthread_join(s->worker, NULL);
+        pthread_cond_destroy(&s->cond);
+        pthread_mutex_destroy(&s->lock);
+        s->worker_started = 0;
+        s->quit = 0;
+        s->job_running = 0;
+    }
+    av_frame_free(&s->pending);
+    av_frame_free(&s->next);
 
     if (s->hwctx) {
         CudaFunctions *cu = s->hwctx->internal->cuda_dl;
@@ -246,20 +286,21 @@ static int add_instance(AVFilterContext *ctx)
     return 0;
 }
 
-/* (Re)start an instance with frame f0 as its previous frame. */
-static int start_instance(AVFilterContext *ctx, FRUCInstance *inst)
+/* (Re)start an instance with buf[buf_idx] (at pts) as its previous frame. */
+static int start_instance(AVFilterContext *ctx, FRUCInstance *inst, int buf_idx,
+                          int64_t pts)
 {
     FRUCCUDAContext *s = ctx->priv;
     FRUCProcParams params = {
-        .frame_in      = &s->buf[s->buf_f0],
-        .timestamp_in  = s->pts0,
+        .frame_in      = &s->buf[buf_idx],
+        .timestamp_in  = pts,
         .frame_out     = &s->buf[2],
-        .timestamp_out = s->pts0,
+        .timestamp_out = pts,
     };
     int err;
 
     av_log(ctx, AV_LOG_DEBUG, "Starting FRUC instance %d at pts %"PRId64
-           " (last %"PRId64")\n", (int)(inst - s->inst), s->pts0, inst->last_pts);
+           " (last %"PRId64")\n", (int)(inst - s->inst), pts, inst->last_pts);
     err = s->fruc_create_session(inst->handle, s->width, s->height, s->nv12);
     if (!err)
         err = s->fruc_register(inst->handle, &s->buf[0], &s->buf[1], &s->buf[2]);
@@ -269,7 +310,7 @@ static int start_instance(AVFilterContext *ctx, FRUCInstance *inst)
         av_log(ctx, AV_LOG_ERROR, "Could not start FRUC (error %d).\n", err);
         return AVERROR_EXTERNAL;
     }
-    inst->last_pts = s->pts0;
+    inst->last_pts = pts;
     return 0;
 }
 
@@ -311,49 +352,134 @@ static int copy_planes(AVFilterContext *ctx, CUdeviceptr dst_buf, AVFrame *frame
     return 0;
 }
 
-static int interpolate_frame(AVFilterContext *ctx, AVFrame *out, int64_t pts)
+/* Run the queued job on the worker thread. */
+static int run_job(AVFilterContext *ctx)
 {
     FRUCCUDAContext *s = ctx->priv;
     CudaFunctions *cu = s->hwctx->internal->cuda_dl;
-    FRUCProcParams params = {
-        .frame_in      = &s->buf[s->buf_f1],
-        .timestamp_in  = s->pts1,
-        .frame_out     = &s->buf[2],
-        .timestamp_out = pts,
-    };
-    FRUCInstance *inst;
+    FRUCInstance *inst = s->job_inst;
     CUcontext dummy;
     int ret, err;
 
     ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
     if (ret < 0)
         return ret;
-
-    if (s->pair_idx == s->nb_inst)
-        ret = add_instance(ctx);
-    if (ret < 0)
-        goto end;
-    inst = &s->inst[s->pair_idx++];
-
-    /* NvOFFRUC does its own stream handling: finish the input copies first,
-     * and wait for it before copying the result out. */
+    /* NvOFFRUC does its own stream handling: finish the input copies (and
+     * the copy of the previous result out of buf[2]) first. Its process call
+     * returns once the output is written. */
     ret = CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
-    if (ret >= 0 && inst->last_pts != s->pts0)
-        ret = start_instance(ctx, inst);
+    if (ret >= 0 && s->job_restart)
+        ret = start_instance(ctx, inst, s->job_buf_f0, s->job_pts0);
     if (ret >= 0) {
-        err = s->fruc_proc(inst->handle, &params);
+        err = s->fruc_proc(inst->handle, &s->job_params);
         if (err) {
             av_log(ctx, AV_LOG_ERROR, "FRUC failed (error %d).\n", err);
             ret = AVERROR_EXTERNAL;
         }
-        inst->last_pts = s->pts1;
+        inst->last_pts = s->job_params.timestamp_in;
     }
-    if (ret >= 0)
-        ret = CHECK_CU(cu->cuCtxSynchronize());
-    if (ret >= 0)
-        ret = copy_planes(ctx, s->buf[2], out, 1);
+    CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+    return ret;
+}
 
-end:
+static void *fruc_worker(void *arg)
+{
+    AVFilterContext *ctx = arg;
+    FRUCCUDAContext *s = ctx->priv;
+    int ret;
+
+    pthread_mutex_lock(&s->lock);
+    for (;;) {
+        while (!s->job_running && !s->quit)
+            pthread_cond_wait(&s->cond, &s->lock);
+        if (!s->job_running)
+            break;
+        pthread_mutex_unlock(&s->lock);
+        ret = run_job(ctx);
+        pthread_mutex_lock(&s->lock);
+        s->job_err = ret;
+        s->job_running = 0;
+        pthread_cond_broadcast(&s->cond);
+    }
+    pthread_mutex_unlock(&s->lock);
+    return NULL;
+}
+
+/* Queue the interpolation of the current pair at pts into s->pending. */
+static int start_job(AVFilterContext *ctx, int64_t pts)
+{
+    FRUCCUDAContext *s = ctx->priv;
+    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
+    CUcontext dummy;
+    int ret = 0;
+
+    if (s->pair_idx == s->nb_inst) {
+        ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
+        if (ret < 0)
+            return ret;
+        ret = add_instance(ctx);
+        CHECK_CU(cu->cuCtxPopCurrent(&dummy));
+        if (ret < 0)
+            return ret;
+    }
+
+    pthread_mutex_lock(&s->lock);
+    s->job_inst    = &s->inst[s->pair_idx++];
+    s->job_restart = s->job_inst->last_pts != s->pts0;
+    s->job_buf_f0  = s->buf_f0;
+    s->job_pts0    = s->pts0;
+    s->job_params  = (FRUCProcParams) {
+        .frame_in      = &s->buf[s->buf_f1],
+        .timestamp_in  = s->pts1,
+        .frame_out     = &s->buf[2],
+        .timestamp_out = pts,
+    };
+    s->job_err     = 0;
+    s->job_running = 1;
+    pthread_cond_broadcast(&s->cond);
+    pthread_mutex_unlock(&s->lock);
+    return 0;
+}
+
+static int job_running(FRUCCUDAContext *s)
+{
+    int running;
+
+    pthread_mutex_lock(&s->lock);
+    running = s->job_running;
+    pthread_mutex_unlock(&s->lock);
+    return running;
+}
+
+/* Wait for the job; return its result. */
+static int wait_job(FRUCCUDAContext *s)
+{
+    int ret;
+
+    pthread_mutex_lock(&s->lock);
+    while (s->job_running)
+        pthread_cond_wait(&s->cond, &s->lock);
+    ret = s->job_err;
+    pthread_mutex_unlock(&s->lock);
+    return ret;
+}
+
+/* Wait for the job and copy its result into s->pending. */
+static int finish_job(AVFilterContext *ctx)
+{
+    FRUCCUDAContext *s = ctx->priv;
+    CudaFunctions *cu = s->hwctx->internal->cuda_dl;
+    CUcontext dummy;
+    int ret;
+
+    ret = wait_job(s);
+    if (ret < 0)
+        return ret;
+
+    ret = CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
+    if (ret < 0)
+        return ret;
+    ret = copy_planes(ctx, s->buf[2], s->pending, 1);
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     return ret;
 }
@@ -389,6 +515,21 @@ static int process_work_frame(AVFilterContext *ctx)
     int64_t work_pts, snap;
     int ret;
 
+    /* An interpolated frame precedes everything after it. */
+    if (s->pending) {
+        if (job_running(s))
+            return 2;
+        ret = finish_job(ctx);
+        if (ret < 0) {
+            av_frame_free(&s->pending);
+            return ret;
+        }
+        s->work = s->pending;
+        s->pending = NULL;
+        s->n++;
+        return 1;
+    }
+
     if (!s->f1)
         return 0;
     if (!s->f0 && !s->flush)
@@ -419,14 +560,18 @@ static int process_work_frame(AVFilterContext *ctx)
         } else if (s->pts1 - work_pts <= snap) {
             ret = passthrough_frame(&s->work, s->f1);
         } else {
-            s->work = ff_get_video_buffer(outlink, outlink->w, outlink->h);
-            if (!s->work)
+            s->pending = ff_get_video_buffer(outlink, outlink->w, outlink->h);
+            if (!s->pending)
                 return AVERROR(ENOMEM);
-            ret = av_frame_copy_props(s->work, s->f0);
+            ret = av_frame_copy_props(s->pending, s->f0);
             if (ret >= 0)
-                ret = interpolate_frame(ctx, s->work, work_pts);
-            if (ret < 0)
-                av_frame_free(&s->work);
+                ret = start_job(ctx, work_pts);
+            if (ret < 0) {
+                av_frame_free(&s->pending);
+                return ret;
+            }
+            s->pending->pts = work_pts;
+            return 2;
         }
         if (ret < 0)
             return ret;
@@ -438,13 +583,64 @@ static int process_work_frame(AVFilterContext *ctx)
     return 1;
 }
 
+/* Make in (from the input) the current frame, f1. Takes ownership. */
+static int take_input(AVFilterContext *ctx, AVFrame *in)
+{
+    FRUCCUDAContext *s = ctx->priv;
+    int64_t pts;
+    int ret;
+
+    if (in->flags & AV_FRAME_FLAG_INTERLACED)
+        av_log(ctx, AV_LOG_WARNING, "Interlaced frame found - the output will not be correct.\n");
+
+    if (in->pts == AV_NOPTS_VALUE) {
+        av_log(ctx, AV_LOG_WARNING, "Ignoring frame without PTS.\n");
+        av_frame_free(&in);
+        return 0;
+    }
+
+    pts = av_rescale_q(in->pts, s->srce_time_base, s->dest_time_base);
+    if (s->f1 && pts == s->pts1) {
+        av_log(ctx, AV_LOG_WARNING, "Ignoring frame with same PTS.\n");
+        av_frame_free(&in);
+        return 0;
+    }
+
+    ret = store_input(ctx, in);
+    if (ret < 0) {
+        av_frame_free(&in);
+        return ret;
+    }
+
+    av_frame_free(&s->f0);
+    s->f0 = s->f1;
+    s->pts0 = s->pts1;
+    s->f1 = in;
+    s->pts1 = pts;
+    s->delta = s->pts1 - s->pts0;
+    s->pair_idx = 0;
+
+    if (s->delta < 0) {
+        av_log(ctx, AV_LOG_WARNING, "PTS discontinuity.\n");
+        s->start_pts = s->pts1;
+        s->n = 0;
+        av_frame_free(&s->f0);
+        for (int i = 0; i < s->nb_inst; i++)
+            s->inst[i].last_pts = AV_NOPTS_VALUE;
+    }
+
+    if (s->start_pts == AV_NOPTS_VALUE)
+        s->start_pts = s->pts1;
+    return 0;
+}
+
 static int fruc_activate(AVFilterContext *ctx)
 {
     int ret, status;
     AVFilterLink *inlink = ctx->inputs[0];
     AVFilterLink *outlink = ctx->outputs[0];
     FRUCCUDAContext *s = ctx->priv;
-    AVFrame *inpicref;
+    AVFrame *in;
     int64_t pts;
 
     FF_FILTER_FORWARD_STATUS_BACK(outlink, inlink);
@@ -456,65 +652,56 @@ retry:
     else if (ret == 1)
         return ff_filter_frame(outlink, s->work);
 
-    ret = ff_inlink_consume_frame(inlink, &inpicref);
-    if (ret < 0)
-        return ret;
-
-    if (inpicref) {
-        if (inpicref->flags & AV_FRAME_FLAG_INTERLACED)
-            av_log(ctx, AV_LOG_WARNING, "Interlaced frame found - the output will not be correct.\n");
-
-        if (inpicref->pts == AV_NOPTS_VALUE) {
-            av_log(ctx, AV_LOG_WARNING, "Ignoring frame without PTS.\n");
-            av_frame_free(&inpicref);
+    if (ret == 2) {
+        /* A job is running. Fetch the next input meanwhile (without using it
+         * yet), so that the filters before this one prepare it; only then,
+         * or at EOF, wait for the job. */
+        if (!s->next && !s->eof) {
+            ret = ff_inlink_consume_frame(inlink, &s->next);
+            if (ret < 0)
+                return ret;
+            if (!s->next) {
+                if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
+                    s->eof        = 1;
+                    s->eof_status = status;
+                    s->eof_pts    = pts;
+                    goto retry;
+                }
+                ff_inlink_request_frame(inlink);
+                return FFERROR_NOT_READY;
+            }
         }
-    }
-
-    if (inpicref) {
-        pts = av_rescale_q(inpicref->pts, s->srce_time_base, s->dest_time_base);
-
-        if (s->f1 && pts == s->pts1) {
-            av_log(ctx, AV_LOG_WARNING, "Ignoring frame with same PTS.\n");
-            av_frame_free(&inpicref);
-        }
-    }
-
-    if (inpicref) {
-        ret = store_input(ctx, inpicref);
-        if (ret < 0) {
-            av_frame_free(&inpicref);
-            return ret;
-        }
-
-        av_frame_free(&s->f0);
-        s->f0 = s->f1;
-        s->pts0 = s->pts1;
-        s->f1 = inpicref;
-        s->pts1 = pts;
-        s->delta = s->pts1 - s->pts0;
-        s->pair_idx = 0;
-
-        if (s->delta < 0) {
-            av_log(ctx, AV_LOG_WARNING, "PTS discontinuity.\n");
-            s->start_pts = s->pts1;
-            s->n = 0;
-            av_frame_free(&s->f0);
-            for (int i = 0; i < s->nb_inst; i++)
-                s->inst[i].last_pts = AV_NOPTS_VALUE;
-        }
-
-        if (s->start_pts == AV_NOPTS_VALUE)
-            s->start_pts = s->pts1;
-
+        /* process_work_frame() then outputs s->pending. */
+        wait_job(s);
         goto retry;
     }
 
-    if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
+    /* The current pair is done: move on to the next input. */
+    in = s->next;
+    s->next = NULL;
+    if (!in && !s->eof) {
+        ret = ff_inlink_consume_frame(inlink, &in);
+        if (ret < 0)
+            return ret;
+    }
+    if (in) {
+        ret = take_input(ctx, in);
+        if (ret < 0)
+            return ret;
+        goto retry;
+    }
+
+    if (!s->eof && ff_inlink_acknowledge_status(inlink, &status, &pts)) {
+        s->eof        = 1;
+        s->eof_status = status;
+        s->eof_pts    = pts;
+    }
+    if (s->eof) {
         if (!s->flush) {
             s->flush = 1;
             goto retry;
         }
-        ff_outlink_set_status(outlink, status, pts);
+        ff_outlink_set_status(outlink, s->eof_status, s->eof_pts);
         return 0;
     }
 
@@ -627,7 +814,25 @@ static av_cold int fruc_config_output(AVFilterLink *outlink)
     if (ret >= 0)
         ret = add_instance(ctx);
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
-    return ret;
+    if (ret < 0)
+        return ret;
+
+    ret = AVERROR(pthread_mutex_init(&s->lock, NULL));
+    if (ret < 0)
+        return ret;
+    ret = AVERROR(pthread_cond_init(&s->cond, NULL));
+    if (ret < 0) {
+        pthread_mutex_destroy(&s->lock);
+        return ret;
+    }
+    ret = AVERROR(pthread_create(&s->worker, NULL, fruc_worker, ctx));
+    if (ret < 0) {
+        pthread_cond_destroy(&s->cond);
+        pthread_mutex_destroy(&s->lock);
+        return ret;
+    }
+    s->worker_started = 1;
+    return 0;
 }
 
 static const AVFilterPad fruc_cuda_inputs[] = {
