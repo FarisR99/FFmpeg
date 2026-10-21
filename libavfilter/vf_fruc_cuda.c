@@ -563,6 +563,9 @@ static int process_work_frame(AVFilterContext *ctx)
             s->pending = ff_get_video_buffer(outlink, outlink->w, outlink->h);
             if (!s->pending)
                 return AVERROR(ENOMEM);
+            /* The input's frame pool may be larger (scale_cuda aligns it). */
+            s->pending->width  = outlink->w;
+            s->pending->height = outlink->h;
             ret = av_frame_copy_props(s->pending, s->f0);
             if (ret >= 0)
                 ret = start_job(ctx, work_pts);
