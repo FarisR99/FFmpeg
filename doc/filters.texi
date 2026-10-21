@@ -27808,6 +27808,40 @@ JPEG (full) range
 @end table
 
 @anchor{overlay_cuda}
+@section fruc_cuda
+
+Frame rate up-conversion with NVIDIA Optical Flow FRUC, which synthesises
+intermediate frames from hardware optical flow. Where the flow is unreliable
+it falls back to repeating a frame rather than producing warped output.
+
+The input must be CUDA frames in @code{nv12} (even size) or 8-bit packed RGB
+(@code{rgba}, @code{bgra}, @code{rgb0} or @code{bgr0}). Convert 10-bit video
+first, e.g. with @code{scale_cuda=format=nv12}. The output has the same format.
+
+This filter requires Windows and an NVIDIA Turing or newer GPU. The Optical
+Flow SDK is not linked; it is loaded at runtime through
+@file{NVEncNVOFFRUC.dll}, which needs @file{NvOFFRUC.dll} and
+@file{cudart64_110.dll}. Place all three next to the executable.
+
+It accepts the following parameters:
+
+@table @option
+@item fps
+The output frame rate, as an expression that may use @var{source_fps}, the
+input frame rate. Default is @code{source_fps*2}.
+@end table
+
+Output timing matches the fruc_vulkan filter: an output frame that falls on an
+input frame is that input frame.
+
+@subsection Example
+
+Double the frame rate of a decoded video and encode it:
+@example
+ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i INPUT \
+  -vf "scale_cuda=format=nv12,fruc_cuda" -c:v hevc_nvenc OUTPUT
+@end example
+
 @section overlay_cuda
 
 Overlay one video on top of another.
