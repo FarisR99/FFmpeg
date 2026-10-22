@@ -267,6 +267,7 @@ typedef struct LibplaceboContext {
     char *shader_path;
     void *shader_bin;
     int shader_bin_len;
+    int shader_half;
     const struct pl_hook *hooks[2];
     int num_hooks;
 } LibplaceboContext;
@@ -496,7 +497,14 @@ static int parse_shader(AVFilterContext *avctx, const void *shader, size_t len)
     LibplaceboContext *s = avctx->priv;
     const struct pl_hook *hook;
 
+#if PL_API_VER >= 378
+    hook = pl_mpv_user_shader_parse_params(s->gpu, shader, len,
+                pl_mpv_user_shader_params(.half_precision = s->shader_half));
+#else
+    if (s->shader_half)
+        av_log(avctx, AV_LOG_WARNING, "custom_shader_half needs a newer libplacebo; ignored.\n");
     hook = pl_mpv_user_shader_parse(s->gpu, shader, len);
+#endif
     if (!hook) {
         av_log(avctx, AV_LOG_ERROR, "Failed parsing custom shader!\n");
         return AVERROR(EINVAL);
@@ -1786,6 +1794,7 @@ static const AVOption libplacebo_options[] = {
 
     { "custom_shader_path", "Path to custom user shader (mpv .hook format)", OFFSET(shader_path), AV_OPT_TYPE_STRING, .flags = STATIC },
     { "custom_shader_bin", "Custom user shader as binary (mpv .hook format)", OFFSET(shader_bin), AV_OPT_TYPE_BINARY, .flags = STATIC },
+    { "custom_shader_half", "Run the custom shader at half (16-bit) precision", OFFSET(shader_half), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, STATIC },
 
     /* Performance/quality tradeoff options */
     { "skip_aa", "Skip anti-aliasing", OFFSET(skip_aa), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, DYNAMIC },
