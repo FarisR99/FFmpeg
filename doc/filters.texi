@@ -17781,7 +17781,8 @@ Run the custom shader's own code at half (16-bit) precision, by declaring
 such as Intel integrated graphics, can run shaders like Anime4K much faster
 (60–90% faster on an Intel UHD 770); others, such as NVIDIA GPUs, gain nothing.
 Only enable it for shaders that tolerate 16-bit intermediate values. Requires
-libplacebo API 378. Disabled by default.
+a libplacebo with @code{pl_mpv_user_shader_parse_params} (MediaStack's). Disabled by
+default.
 @end table
 
 @subsubsection Debugging / performance

@@ -497,12 +497,12 @@ static int parse_shader(AVFilterContext *avctx, const void *shader, size_t len)
     LibplaceboContext *s = avctx->priv;
     const struct pl_hook *hook;
 
-#if PL_API_VER >= 378
+#ifdef pl_mpv_user_shader_params /* MediaStack libplacebo only */
     hook = pl_mpv_user_shader_parse_params(s->gpu, shader, len,
                 pl_mpv_user_shader_params(.half_precision = s->shader_half));
 #else
     if (s->shader_half)
-        av_log(avctx, AV_LOG_WARNING, "custom_shader_half needs a newer libplacebo; ignored.\n");
+        av_log(avctx, AV_LOG_WARNING, "custom_shader_half needs MediaStack's libplacebo; ignored.\n");
     hook = pl_mpv_user_shader_parse(s->gpu, shader, len);
 #endif
     if (!hook) {
