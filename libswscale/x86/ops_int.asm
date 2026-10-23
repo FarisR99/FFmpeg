@@ -134,9 +134,12 @@ assert COMPS == 1
 %if cpuflag(avx2)
         vpermq mx, mx, q3120
 IF V2,  vpermq mx2, mx2, q3120
-%endif
         movu [out0q], xmx
 IF V2,  movu [out0q + (mmsize >> 1)], xmx2
+%else
+        movq [out0q], mx
+IF V2,  movq [out0q + (mmsize >> 1)], mx2
+%endif
         add out0q, BLOCK_WIDTH >> 1
         RET
 %endmacro
@@ -147,8 +150,8 @@ assert COMPS == 1
         vpbroadcastd mx,  [in0q]
 IF V2,  vpbroadcastd mx2, [in0q + 4]
 %else
-        movd mx, [in0q]
-IF V2,  movd mx2, [in0q + 2]
+        pinsrw mx, [in0q], 0
+IF V2,  pinsrw mx2, [in0q + 2], 0
 %endif
         mova m8, [bits_shuf]
         VBROADCASTI128 m9,  [bits_mask]

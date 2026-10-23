@@ -199,6 +199,8 @@ typedef struct OutputFilterPriv {
     void                   *log_parent;
     char                    log_name[32];
 
+#define NEEDED_EXPLICIT 1
+#define NEEDED_INTERNAL 2
     int                     needed;
 
     /* desired output stream properties */
@@ -921,7 +923,8 @@ int ofilter_bind_enc(OutputFilter *ofilter, unsigned sched_idx_enc,
     av_assert0(!opts->enc ||
                ofilter->type == opts->enc->type);
 
-    ofp->needed = ofilter->bound = 1;
+    ofp->needed = NEEDED_EXPLICIT;
+    ofilter->bound = 1;
     av_freep(&ofilter->linklabel);
 
     ofp->flags       |= opts->flags;
@@ -1043,7 +1046,7 @@ static int ofilter_bind_ifilter(OutputFilter *ofilter, InputFilterPriv *ifp,
     av_assert0(!ofilter->bound);
     av_assert0(ofilter->type == ifp->ifilter.type);
 
-    ofp->needed = ofilter->bound = 1;
+    ofilter->bound = 1;
     av_freep(&ofilter->linklabel);
 
     ofilter->output_name = av_strdup(opts->name);
@@ -1469,7 +1472,7 @@ static int fg_complex_bind_input(FilterGraph *fg, InputFilter *ifilter, int comm
                             return ret;
                         }
                     } else
-                        ofp_from_ofilter(ofilter)->needed = 1;
+                        ofp_from_ofilter(ofilter)->needed = NEEDED_INTERNAL;
                     return 0;
                 }
             }
@@ -1544,7 +1547,7 @@ static int fg_complex_bind_input(FilterGraph *fg, InputFilter *ifilter, int comm
                             return ret;
                         }
                     } else
-                        ofp_from_ofilter(ofilter)->needed = 1;
+                        ofp_from_ofilter(ofilter)->needed = NEEDED_INTERNAL;
                     return 0;
                 }
             }
@@ -1601,13 +1604,21 @@ int fg_finalise_bindings(void)
 {
     int ret;
 
+retry:
+    for (int i = 0; i < nb_filtergraphs; i++) {
+        FilterGraph *fg = filtergraphs[i];
+        for (int j = 0; j < fg->nb_outputs; j++) {
+            OutputFilter *output = fg->outputs[j];
+            ofp_from_ofilter(output)->needed &= ~NEEDED_INTERNAL;
+        }
+    }
     for (int i = 0; i < nb_filtergraphs; i++) {
         ret = bind_inputs(filtergraphs[i], 0);
         if (ret < 0)
             return ret;
     }
 
-    // check that all outputs were bound
+    // check that all outputs were marked as needed to be bound
     for (int i = nb_filtergraphs - 1; i >= 0; i--) {
         FilterGraph *fg = filtergraphs[i];
         FilterGraphPriv *fgp = fgp_from_fg(filtergraphs[i]);
@@ -1634,7 +1645,7 @@ int fg_finalise_bindings(void)
                     memmove(&filtergraphs[i],
                             &filtergraphs[i + 1],
                             (nb_filtergraphs - i) * sizeof(*filtergraphs));
-                break;
+                goto retry;
             }
         }
     }
@@ -2393,7 +2404,8 @@ static int ifilter_parameters_from_frame(InputFilter *ifilter, const AVFrame *fr
     sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
     if (sd) {
         memcpy(ifp->displaymatrix, sd->data, sizeof(ifp->displaymatrix));
-        if (ifp->opts.flags & IFILTER_FLAG_AUTOROTATE)
+        if ((ifp->opts.flags & IFILTER_FLAG_AUTOROTATE) &&
+            !(av_pix_fmt_desc_get(ifp->format)->flags & AV_PIX_FMT_FLAG_HWACCEL))
             av_frame_side_data_remove(&ifp->side_data, &ifp->nb_side_data, AV_FRAME_DATA_DISPLAYMATRIX);
     }
     ifp->displaymatrix_present = !!sd;

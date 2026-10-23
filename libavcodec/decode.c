@@ -324,6 +324,7 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
     AVCodecInternal *avci = avctx->internal;
     AVFrameSideData *side;
     uint32_t discard_padding = 0;
+    int nb_samples = frame->nb_samples;
     uint8_t skip_reason = 0;
     uint8_t discard_reason = 0;
 
@@ -399,7 +400,9 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
         }
     }
 
-    if (discard_padding > 0 && discard_padding <= frame->nb_samples) {
+    if (discard_padding > 0 && discard_padding <= nb_samples) {
+        // The padding may overlap the samples skipped at the start.
+        discard_padding = FFMIN(discard_padding, frame->nb_samples);
         if (discard_padding == frame->nb_samples) {
             av_log(avctx, AV_LOG_DEBUG, "discard whole frame\n");
             *discarded_samples += frame->nb_samples;
@@ -2118,6 +2121,7 @@ av_cold int ff_decode_preinit(AVCodecContext *avctx)
     else {
         for (unsigned i = 0; i < avctx->nb_side_data_prefer_packet; i++) {
             int val = avctx->side_data_prefer_packet[i];
+            int mapped = 0;
 
             if (val < 0 || val >= AV_PKT_DATA_NB) {
                 av_log(avctx, AV_LOG_ERROR, "Invalid side data type: %d\n", val);
@@ -2126,6 +2130,7 @@ av_cold int ff_decode_preinit(AVCodecContext *avctx)
 
             for (unsigned j = 0; ff_sd_global_map[j].packet < AV_PKT_DATA_NB; j++) {
                 if (ff_sd_global_map[j].packet == val) {
+                    mapped = 1;
                     val = ff_sd_global_map[j].frame;
 
                     // this code will need to be changed when we have more than
@@ -2138,6 +2143,12 @@ av_cold int ff_decode_preinit(AVCodecContext *avctx)
                     dc->side_data_pref_mask |= 1ULL << val;
                 }
             }
+
+            if (!mapped)
+                av_log(avctx, AV_LOG_WARNING,
+                       "Side data type %s has no frame side data counterpart, "
+                       "ignoring it in side_data_prefer_packet\n",
+                       av_packet_side_data_name(val));
         }
     }
 
