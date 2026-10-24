@@ -150,8 +150,10 @@ typedef struct FRUCCUDAContext {
     AVFrame *f1;        ///< current frame
     int64_t pts0;       ///< last frame pts in dest_time_base
     int64_t pts1;       ///< current frame pts in dest_time_base
+    int64_t prev_pts0;  ///< pts0 of the previous pair, or AV_NOPTS_VALUE
     int64_t delta;      ///< pts1 to pts0 delta
     int flush;
+    int keep_warm;      ///< keep instances contiguous across one skipped pair
     int64_t start_pts;  ///< pts of the first output frame
     int64_t n;          ///< output frame counter
 } FRUCCUDAContext;
@@ -161,6 +163,8 @@ typedef struct FRUCCUDAContext {
 static const AVOption fruc_cuda_options[] = {
     { "fps", "A string describing the desired output frame rate",
       OFFSET(requested_frame_rate), AV_OPT_TYPE_STRING, { .str = "source_fps*2" }, 0, 0, FLAGS },
+    { "keep_warm", "Keep optical-flow instances warm across a skipped pair",
+      OFFSET(keep_warm), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, FLAGS },
     { NULL }
 };
 
@@ -223,7 +227,10 @@ static av_cold int fruc_init(AVFilterContext *ctx)
 {
     FRUCCUDAContext *s = ctx->priv;
 
-    s->start_pts = AV_NOPTS_VALUE;
+    s->start_pts  = AV_NOPTS_VALUE;
+    s->pts0       = AV_NOPTS_VALUE;
+    s->pts1       = AV_NOPTS_VALUE;
+    s->prev_pts0  = AV_NOPTS_VALUE;
     return 0;
 }
 
@@ -368,8 +375,31 @@ static int run_job(AVFilterContext *ctx)
      * the copy of the previous result out of buf[2]) first. Its process call
      * returns once the output is written. */
     ret = CHECK_CU(cu->cuStreamSynchronize(s->cu_stream));
-    if (ret >= 0 && s->job_restart)
-        ret = start_instance(ctx, inst, s->job_buf_f0, s->job_pts0);
+    if (ret >= 0 && s->job_restart) {
+        if (s->keep_warm && inst->last_pts != AV_NOPTS_VALUE &&
+            inst->last_pts == s->prev_pts0) {
+            /* The instance missed exactly one pair. Feed it that pair's
+             * second frame and discard the result, so it stays contiguous
+             * instead of starting a new optical-flow session. */
+            FRUCProcParams catchup = {
+                .frame_in      = &s->buf[s->job_buf_f0],
+                .timestamp_in  = s->job_pts0,
+                .frame_out     = &s->buf[2],
+                .timestamp_out = s->job_pts0,
+            };
+            av_log(ctx, AV_LOG_DEBUG, "Advancing FRUC instance %d over a "
+                   "skipped pair\n", (int)(inst - s->inst));
+            err = s->fruc_proc(inst->handle, &catchup);
+            if (err) {
+                av_log(ctx, AV_LOG_ERROR, "FRUC failed (error %d).\n", err);
+                ret = AVERROR_EXTERNAL;
+            } else {
+                inst->last_pts = s->job_pts0;
+            }
+        } else {
+            ret = start_instance(ctx, inst, s->job_buf_f0, s->job_pts0);
+        }
+    }
     if (ret >= 0) {
         err = s->fruc_proc(inst->handle, &s->job_params);
         if (err) {
@@ -617,6 +647,7 @@ static int take_input(AVFilterContext *ctx, AVFrame *in)
 
     av_frame_free(&s->f0);
     s->f0 = s->f1;
+    s->prev_pts0 = s->pts0;
     s->pts0 = s->pts1;
     s->f1 = in;
     s->pts1 = pts;
@@ -627,6 +658,7 @@ static int take_input(AVFilterContext *ctx, AVFrame *in)
         av_log(ctx, AV_LOG_WARNING, "PTS discontinuity.\n");
         s->start_pts = s->pts1;
         s->n = 0;
+        s->prev_pts0 = AV_NOPTS_VALUE;
         av_frame_free(&s->f0);
         for (int i = 0; i < s->nb_inst; i++)
             s->inst[i].last_pts = AV_NOPTS_VALUE;

@@ -27841,6 +27841,15 @@ It accepts the following parameters:
 @item fps
 The output frame rate, as an expression that may use @var{source_fps}, the
 input frame rate. Default is @code{source_fps*2}.
+
+@item keep_warm
+Keep an optical-flow instance contiguous when it skipped exactly one frame
+pair, by feeding that pair through it and discarding the result, instead of
+starting a new session. This reduces session restarts (and NVIDIA's
+``Optical Flow Grid Size'' message) at fractional output frame rates such as
+@code{fps=60} from 24 fps. The interpolation at those points differs from a
+restart. Pairs skipped across more than one pair still restart. Default is
+@code{false}.
 @end table
 
 Output timing matches the fruc_vulkan filter: an output frame that falls on an
