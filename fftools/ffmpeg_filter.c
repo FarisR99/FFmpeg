@@ -2231,10 +2231,13 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
         fgt->graph->nb_threads = filter_complex_nbthreads;
     }
 
-    if (filter_buffered_frames) {
-        ret = av_opt_set_int(fgt->graph, "max_buffered_frames", filter_buffered_frames, 0);
+    for (int type = 0; type < AVMEDIA_TYPE_NB; type++) {
+        const int limit = filter_buffered_frames[type];
+        if (limit <= 0)
+            continue;
+        ret = avfilter_graph_set_max_buffered_frames(fgt->graph, type, limit);
         if (ret < 0)
-            return ret;
+            goto fail;
     }
 
     hw_device = hw_device_for_filter();
@@ -2337,7 +2340,9 @@ static int configure_filtergraph(FilterGraph *fg, FilterGraphThread *fgt)
     /* send the EOFs for the finished inputs */
     for (int i = 0; i < fg->nb_inputs; i++) {
         InputFilter *ifilter = fg->inputs[i];
-        if (fgt->eof_in[i]) {
+        InputFilterPriv *ifp = ifp_from_ifilter(ifilter);
+
+        if (fgt->eof_in[i] || ifp->eof) {
             ret = av_buffersrc_add_frame(ifilter->filter, NULL);
             if (ret < 0)
                 goto fail;
@@ -2497,8 +2502,9 @@ static int choose_input(const FilterGraph *fg, const FilterGraphThread *fgt)
 
     for (int i = 0; i < fg->nb_inputs; i++) {
         InputFilter *ifilter = fg->inputs[i];
+        InputFilterPriv *ifp = ifp_from_ifilter(ifilter);
 
-        if (fgt->eof_in[i])
+        if (fgt->eof_in[i] || ifp->eof)
             continue;
 
         nb_requests = av_buffersrc_get_nb_failed_requests(ifilter->filter);
@@ -3057,6 +3063,14 @@ static int read_frames(FilterGraph *fg, FilterGraphThread *fgt,
 
 
         ret = avfilter_graph_request_oldest(fgt->graph);
+
+        // ensure all inputs no longer accepting data are closed
+        for (int i = 0; i < fg->nb_inputs; i++) {
+            InputFilterPriv *ifp = ifp_from_ifilter(fg->inputs[i]);
+            if (av_buffersrc_get_status(ifp->ifilter.filter))
+                close_input(ifp);
+        }
+
         if (ret == AVERROR(EAGAIN)) {
             fgt->next_in = choose_input(fg, fgt);
             return 0;
@@ -3568,7 +3582,7 @@ static int filter_thread(void *arg)
             av_log(fg, AV_LOG_VERBOSE, "Input %u no longer accepts new data\n",
                    input_idx);
             close_input(ifp);
-            continue;
+            goto read_frames;
         }
         if (ret < 0)
             goto finish;
@@ -3585,13 +3599,6 @@ read_frames:
             av_log(fg, AV_LOG_ERROR, "Error sending frames to consumers: %s\n",
                    av_err2str(ret));
             goto finish;
-        }
-
-        // ensure all inputs no longer accepting data are closed
-        for (int i = 0; fgt.graph && i < fg->nb_inputs; i++) {
-            InputFilterPriv *ifp = ifp_from_ifilter(fg->inputs[i]);
-            if (av_buffersrc_get_status(ifp->ifilter.filter))
-                close_input(ifp);
         }
     }
 

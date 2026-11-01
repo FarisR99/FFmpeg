@@ -38,8 +38,8 @@ typedef struct MemcpyPriv {
 
 /* Memcpy backend for trivial cases */
 
-static void process(const SwsOpExec *exec, const void *priv,
-                    int x_start, int y_start, int x_end, int y_end)
+static void process_memcpy(const SwsOpExec *exec, const void *priv,
+                           int x_start, int y_start, int x_end, int y_end)
 {
     const MemcpyPriv *p = priv;
     const int lines = y_end - y_start;
@@ -75,7 +75,7 @@ static void process(const SwsOpExec *exec, const void *priv,
     }
 }
 
-static int compile(SwsContext *ctx, const SwsOpList *ops, SwsCompiledOp *out)
+static int compile_ops_memcpy(SwsContext *ctx, const SwsOpList *ops, SwsCompiledOp *out)
 {
     MemcpyPriv p = {0};
 
@@ -139,7 +139,7 @@ static int compile(SwsContext *ctx, const SwsOpList *ops, SwsCompiledOp *out)
     *out = (SwsCompiledOp) {
         .slice_align = 1,
         .block_size  = 1,
-        .func = process,
+        .func = process_memcpy,
         .priv = av_memdup(&p, sizeof(p)),
         .free = av_free,
     };
@@ -149,6 +149,6 @@ static int compile(SwsContext *ctx, const SwsOpList *ops, SwsCompiledOp *out)
 const SwsOpBackend backend_murder = {
     .name       = "memcpy",
     .flags      = SWS_BACKEND_MEMCPY,
-    .compile    = compile,
+    .compile    = compile_ops_memcpy,
     .hw_format  = AV_PIX_FMT_NONE,
 };
