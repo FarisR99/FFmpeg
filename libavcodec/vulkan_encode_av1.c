@@ -356,6 +356,7 @@ static int init_pic_params(AVCodecContext *avctx, FFHWBaseEncodePicture *pic,
         av_assert0(pic->nb_refs[0] == 0 || pic->nb_refs[1]);
         ap->av1pic_info.frame_type = STD_VIDEO_AV1_FRAME_TYPE_KEY;
         ap->av1pic_info.refresh_frame_flags = 0xFF;
+        ap->av1pic_info.primary_ref_frame = STD_VIDEO_AV1_PRIMARY_REF_NONE;
         quantization->base_q_idx = enc->q_idx_idr;
         ap->slot = 0;
         ap->last_idr_frame = pic->display_order;
@@ -398,7 +399,7 @@ static int init_pic_params(AVCodecContext *avctx, FFHWBaseEncodePicture *pic,
             ref = pic->refs[0][pic->nb_refs[0] - 2];
             ap_ref = ref->codec_priv;
             ap->av1pic_info.ref_order_hint[ap_ref->slot] = ref->display_order - ap_ref->last_idr_frame;
-            /* The bitstream must name this reference as the driver does. */
+            /* The header must name the same reference the encoder uses for it. */
             name = set_name_slot(ap_ref->av1pic_info.current_frame_id, name_slots, ref_name_mask, 0);
             ap->av1pic_info.ref_frame_idx[name] = ap_ref->slot;
         }
@@ -452,6 +453,10 @@ static int init_pic_params(AVCodecContext *avctx, FFHWBaseEncodePicture *pic,
         .primaryReferenceCdfOnly = 0,
         .generateObuExtensionHeader = 0,
     };
+    /* With rate control on, the driver picks the quantiser; constantQIndex must be 0
+     * (VUID-vkCmdEncodeVideoKHR-constantQIndex-10320). */
+    if (ctx->opts.rc_mode != VK_VIDEO_ENCODE_RATE_CONTROL_MODE_DISABLED_BIT_KHR)
+        ap->vkav1pic_info.constantQIndex = 0;
     encode_info->pNext = &ap->vkav1pic_info;
 
     for (int i = 0; i < FF_ARRAY_ELEMS(ap->vkav1pic_info.referenceNameSlotIndices); i++)

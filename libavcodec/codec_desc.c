@@ -658,8 +658,9 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .id        = AV_CODEC_ID_CAVS,
         .type      = AVMEDIA_TYPE_VIDEO,
         .name      = "cavs",
-        .long_name = NULL_IF_CONFIG_SMALL("Chinese AVS (Audio Video Standard) (AVS1-P2, JiZhun profile)"),
+        .long_name = NULL_IF_CONFIG_SMALL("Chinese AVS (Audio Video Standard) (AVS1-P2/P16)"),
         .props     = AV_CODEC_PROP_LOSSY | AV_CODEC_PROP_REORDER,
+        .profiles  = NULL_IF_CONFIG_SMALL(ff_cavs_profiles),
     },
     {
         .id        = AV_CODEC_ID_JPEG2000,
@@ -2275,6 +2276,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
         .type      = AVMEDIA_TYPE_AUDIO,
         .name      = "pcm_dvda",
         .long_name = NULL_IF_CONFIG_SMALL("PCM signed 16|20|24-bit big-endian for DVD-Audio media"),
+        .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSLESS,
+    },
+    {
+        .id        = AV_CODEC_ID_PCM_PAMF,
+        .type      = AVMEDIA_TYPE_AUDIO,
+        .name      = "pcm_pamf",
+        .long_name = NULL_IF_CONFIG_SMALL("PCM signed 16|20|24-bit big-endian for PAMF streams"),
         .props     = AV_CODEC_PROP_INTRA_ONLY | AV_CODEC_PROP_LOSSLESS,
     },
 

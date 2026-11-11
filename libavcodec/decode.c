@@ -333,9 +333,9 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
     if (side && side->size >= 10) {
         int skip_samples = AV_RL32(side->data);
         if (skip_samples)
-            avci->skip_samples = skip_samples;
+            avci->skip_samples = av_rescale(skip_samples, frame->sample_rate, avctx->sample_rate);
         avci->skip_samples = FFMAX(0, avci->skip_samples);
-        discard_padding = AV_RL32(side->data + 4);
+        discard_padding = av_rescale(AV_RL32(side->data + 4), frame->sample_rate, avctx->sample_rate);
         av_log(avctx, AV_LOG_DEBUG, "skip %d / discard %d samples due to side data\n",
                avci->skip_samples, (int)discard_padding);
         skip_reason = AV_RL8(side->data + 8);
@@ -374,9 +374,9 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
         } else {
             av_samples_copy(frame->extended_data, frame->extended_data, 0, avci->skip_samples,
                             frame->nb_samples - avci->skip_samples, avctx->ch_layout.nb_channels, frame->format);
-            if (avctx->pkt_timebase.num && avctx->sample_rate) {
+            if (avctx->pkt_timebase.num && frame->sample_rate) {
                 int64_t diff_ts = av_rescale_q(avci->skip_samples,
-                                               (AVRational){1, avctx->sample_rate},
+                                               (AVRational){1, frame->sample_rate},
                                                avctx->pkt_timebase);
                 if (diff_ts != AV_NOPTS_VALUE) {
                     if (frame->pts != AV_NOPTS_VALUE)
@@ -411,7 +411,7 @@ static int discard_samples(AVCodecContext *avctx, AVFrame *frame, int64_t *disca
         } else {
             if (avctx->pkt_timebase.num && avctx->sample_rate) {
                 int64_t diff_ts = av_rescale_q(frame->nb_samples - discard_padding,
-                                               (AVRational){1, avctx->sample_rate},
+                                               (AVRational){1, frame->sample_rate},
                                                avctx->pkt_timebase);
                 frame->duration = diff_ts == AV_NOPTS_VALUE ? 0 : diff_ts;
             } else
@@ -1614,6 +1614,45 @@ int ff_decode_frame_props_from_pkt(const AVCodecContext *avctx,
     return 0;
 }
 
+#if CONFIG_LIBLCEVC_DEC
+static int lcevc_parse_frame(AVCodecContext *avctx, DecodeContext *dc, AVFrame *frame)
+{
+    int ret;
+
+    dc->lcevc.frame = dc->lcevc.ctx &&
+                      av_frame_get_side_data(frame, AV_FRAME_DATA_LCEVC);
+    if (!dc->lcevc.frame)
+        return 0;
+
+    ret = ff_lcevc_parse_frame(dc->lcevc.ctx, frame, &dc->lcevc.format,
+                               &dc->lcevc.base_format,
+                               &dc->lcevc.width, &dc->lcevc.height);
+    int enhance = !ret && dc->lcevc.width && dc->lcevc.height &&
+                  frame->format == dc->lcevc.base_format;
+    if (enhance) {
+        ret = av_image_check_size2(FFMAX(frame->width,  dc->lcevc.width),
+                                   FFMAX(frame->height, dc->lcevc.height),
+                                   avctx->max_pixels, AV_PIX_FMT_NONE, 0, avctx);
+        if (ret < 0) {
+            dc->lcevc.width = dc->lcevc.height = 0;
+            enhance = 0;
+        }
+    }
+    if (ret < 0 && (avctx->err_recognition & AV_EF_EXPLODE))
+        return ret;
+
+    if (!enhance) {
+        dc->lcevc.frame = 0;
+        return 0;
+    }
+
+    dc->lcevc.base_width  = frame->width;
+    dc->lcevc.base_height = frame->height;
+
+    return 0;
+}
+#endif
+
 int ff_decode_frame_props(AVCodecContext *avctx, AVFrame *frame)
 {
     int ret;
@@ -1661,27 +1700,16 @@ int ff_decode_frame_props(AVCodecContext *avctx, AVFrame *frame)
     AVCodecInternal    *avci = avctx->internal;
     DecodeContext        *dc = decode_ctx(avci);
 
-    dc->lcevc.frame = dc->lcevc.ctx &&
-                      av_frame_get_side_data(frame, AV_FRAME_DATA_LCEVC);
+    ret = lcevc_parse_frame(avctx, dc, frame);
+    if (ret < 0)
+        return ret;
 
+    // force get_buffer2() to allocate the base frame with at least the dimensions
+    // of the final enhanced frame, in order to prevent reinitializing the buffer
+    // pools unnecessarely
     if (dc->lcevc.frame) {
-        ret = ff_lcevc_parse_frame(dc->lcevc.ctx, frame, &dc->lcevc.format,
-                                   &dc->lcevc.base_format,
-                                   &dc->lcevc.width, &dc->lcevc.height);
-        if (ret < 0 && (avctx->err_recognition & AV_EF_EXPLODE))
-            return ret;
-
-        // force get_buffer2() to allocate the base frame with at least the dimensions
-        // of the final enhanced frame, in order to prevent reinitializing the buffer
-        // pools unnecessarely
-        if (!ret && dc->lcevc.width && dc->lcevc.height &&
-            frame->format == dc->lcevc.base_format) {
-            dc->lcevc.base_width  = frame->width;
-            dc->lcevc.base_height = frame->height;
-            frame->width  = FFMAX(frame->width,  dc->lcevc.width);
-            frame->height = FFMAX(frame->height, dc->lcevc.height);
-        } else
-            dc->lcevc.frame = 0;
+        frame->width  = FFMAX(frame->width,  dc->lcevc.width);
+        frame->height = FFMAX(frame->height, dc->lcevc.height);
     }
 #endif
 
@@ -1740,23 +1768,9 @@ int ff_attach_decode_data(AVCodecContext *avctx, AVFrame *frame)
     DecodeContext        *dc = decode_ctx(avci);
 
     if (!dc->lcevc.frame) {
-        dc->lcevc.frame = dc->lcevc.ctx &&
-                          av_frame_get_side_data(frame, AV_FRAME_DATA_LCEVC);
-
-        if (dc->lcevc.frame) {
-            int ret = ff_lcevc_parse_frame(dc->lcevc.ctx, frame, &dc->lcevc.format,
-                                           &dc->lcevc.base_format,
-                                           &dc->lcevc.width, &dc->lcevc.height);
-            if (ret < 0 && (avctx->err_recognition & AV_EF_EXPLODE))
-                return ret;
-
-            if (!ret && dc->lcevc.width && dc->lcevc.height &&
-                frame->format == dc->lcevc.base_format) {
-                dc->lcevc.base_width  = frame->width;
-                dc->lcevc.base_height = frame->height;
-            } else
-                dc->lcevc.frame = 0;
-        }
+        int ret = lcevc_parse_frame(avctx, dc, frame);
+        if (ret < 0)
+            return ret;
     }
     if (dc->lcevc.frame) {
         FFLCEVCFrame *frame_ctx;

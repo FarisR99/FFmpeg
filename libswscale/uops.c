@@ -18,15 +18,19 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
+#include <float.h>
+#include <math.h>
 #include <stdbool.h>
 
 #include "libavutil/avassert.h"
+#include "libavutil/intmath.h"
 #include "libavutil/mem.h"
 #include "libavutil/refstruct.h"
 
 #include "ops.h"
 #include "uops.h"
 #include "uops_list.h"
+#include "swscale_internal.h"
 
 int ff_sws_uop_cmp(const SwsUOp *a, const SwsUOp *b)
 {
@@ -236,26 +240,32 @@ static SwsPixelType pixel_type_to_int(SwsUOpFlags flags, const SwsPixelType type
     return SWS_PIXEL_NONE;
 }
 
-static bool exact_product_f32(float a, float b)
+static int significant_bits_f32(float f)
 {
-    volatile float prod   = a * b;
-    volatile float result = b ? prod / b : 0.0f;
-    return !b || result == a;
+    int exp;
+    const uint32_t mant = ldexpf(frexpf(fabsf(f), &exp), FLT_MANT_DIG);
+    return mant ? FLT_MANT_DIG - ff_ctz(mant) : 0;
 }
 
 static bool exact_prod(SwsPixel coef, const SwsOpPad *input)
 {
     if (ff_sws_pixel_type_is_int(input->type))
         return true;
-    else if (!input->min.den || !input->max.den)
-        return false; /* unknown bounds */
 
-    const SwsPixel min = ff_sws_pixel_from_q64(input->type, input->min);
-    const SwsPixel max = ff_sws_pixel_from_q64(input->type, input->max);
     switch (input->type) {
-    case SWS_PIXEL_F32:
-        return exact_product_f32(coef.f32, min.f32) &&
-               exact_product_f32(coef.f32, max.f32);
+    case SWS_PIXEL_F32: {
+        const int bits = significant_bits_f32(coef.f32);
+        if (bits <= 1)
+            return true; /* power of two */
+        if (!(input->flags & SWS_COMP_EXACT) || input->min.den != 1 || input->max.den != 1)
+            return false; /* not only integers, or unknown bounds */
+
+        const uint64_t lo = FFABS64U(input->min.num), hi = FFABS64U(input->max.num);
+        const uint64_t max = FFMAX(lo, hi);
+        if (max >= 1ULL << FLT_MANT_DIG)
+            return false;
+        return bits + (max ? av_log2(max) + 1 : 0) <= FLT_MANT_DIG;
+    }
     }
 
     av_unreachable("Invalid pixel type!");
@@ -475,7 +485,7 @@ static int translate_dither_op(SwsUOpList *ops, SwsUOpFlags flags, const SwsOp *
      * typically 320 bytes for a 16x16 dither matrix. */
     const int stride   = size * sizeof(SwsPixel);
     const int num_rows = ff_sws_dither_height(&uop.par.dither);
-    SwsPixel *matrix = uop.data.ptr = av_refstruct_allocz(num_rows * stride);
+    SwsPixel *matrix = uop.data.ptr = ff_refstruct_calloc(num_rows, stride);
     if (!matrix)
         return AVERROR(ENOMEM);
 
@@ -594,7 +604,7 @@ static int translate_op(SwsContext *ctx, SwsUOpList *uops, SwsUOpFlags flags,
             const SwsPixelType type = op->clear.type[i];
             const SwsPixel px = ff_sws_pixel_from_q64(type, v);
             uop.type = pixel_type_to_int(flags, type);
-            uop.data.vec4[i] = px;
+            uop.data.vec4[i] = ff_sws_pixel_expand32(type, px);
             if (v.num == 0)
                 uop.par.clear.zero |= SWS_COMP(i);
             else if (ff_sws_pixel_is_1s(type, px))
