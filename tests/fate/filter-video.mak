@@ -393,6 +393,25 @@ fate-filter-swaprect: CMD = framecrc -c:v pgmyuv -i $(SRC) -vf swaprect
 
 FATE_FILTER_VSYNTH_PGMYUV-$(CONFIG_SWAPRECT_FILTER) += $(FATE_SWAPRECT)
 
+FATE_FILTER-$(call ALLYES, COLOR_FILTER LAVFI_INDEV SWAPRECT_FILTER \
+                              WRAPPED_AVFRAME_DECODER WRAPPED_AVFRAME_ENCODER \
+                              NULL_MUXER) += fate-filter-swaprect-invalid-size \
+                                             fate-filter-swaprect-invalid-fractional-size \
+                                             fate-filter-swaprect-invalid-coordinate \
+                                             fate-filter-swaprect-nonfinite-coordinate
+fate-filter-swaprect-invalid-size: CMD = run $(FFMPEG) -nostdin -hide_banner -f lavfi -i "color=c=black:s=16x16:r=1" -vf "swaprect=w=-1:h=1:x1=0:y1=0:x2=1:y2=0" -frames:v 1 -f null none ; ret=$$?; test $$ret -eq 234
+fate-filter-swaprect-invalid-size: CMP = grep
+fate-filter-swaprect-invalid-size: REF = Rectangle dimensions must be positive
+fate-filter-swaprect-invalid-fractional-size: CMD = run $(FFMPEG) -nostdin -hide_banner -f lavfi -i "color=c=black:s=16x16:r=1" -vf "swaprect=w=0.5:h=1:x1=0:y1=0:x2=1:y2=0" -frames:v 1 -f null none ; ret=$$?; test $$ret -eq 234
+fate-filter-swaprect-invalid-fractional-size: CMP = grep
+fate-filter-swaprect-invalid-fractional-size: REF = Rectangle dimensions must be positive
+fate-filter-swaprect-invalid-coordinate: CMD = run $(FFMPEG) -nostdin -hide_banner -f lavfi -i "color=c=black:s=16x16:r=1" -vf "swaprect=w=1:h=1:x1=1e100:y1=0:x2=1:y2=0" -frames:v 1 -f null none ; ret=$$?; test $$ret -eq 234
+fate-filter-swaprect-invalid-coordinate: CMP = grep
+fate-filter-swaprect-invalid-coordinate: REF = Rectangle expression result is not representable as an integer
+fate-filter-swaprect-nonfinite-coordinate: CMD = run $(FFMPEG) -nostdin -hide_banner -f lavfi -i "color=c=black:s=16x16:r=1" -vf "swaprect=w=1:h=1:x1=1/0:y1=0:x2=1:y2=0" -frames:v 1 -f null none ; ret=$$?; test $$ret -eq 234
+fate-filter-swaprect-nonfinite-coordinate: CMP = grep
+fate-filter-swaprect-nonfinite-coordinate: REF = Rectangle expression result is not representable as an integer
+
 FATE_FILTER_VSYNTH_PGMYUV-$(CONFIG_TBLEND_FILTER) += fate-filter-tblend
 fate-filter-tblend: CMD = framecrc -c:v pgmyuv -i $(SRC) -vf tblend=all_mode=difference128
 
@@ -915,6 +934,10 @@ fate-filter-metadata-cropdetect1: CMD = run $(FILTER_METADATA_COMMAND) "sws_flag
 FATE_METADATA_FILTER-$(call ALLYES, $(CROPDETECT_DEPS)) += fate-filter-metadata-cropdetect2
 fate-filter-metadata-cropdetect2: SRC = $(TARGET_SAMPLES)/filter/cropdetect2.mp4
 fate-filter-metadata-cropdetect2: CMD = run $(FILTER_METADATA_COMMAND) "sws_flags=+accurate_rnd+bitexact;movie='$(SRC)',mestimate,cropdetect=mode=mvedges,metadata=mode=print"
+
+IDET_DEPS = FFPROBE LAVFI_INDEV WRAPPED_AVFRAME_DECODER TESTSRC2_FILTER WEAVE_FILTER CONCAT_FILTER CROP_FILTER FORMAT_FILTER SCALE_FILTER IDET_FILTER
+FATE_FILTER_FFPROBE-$(call ALLYES, $(IDET_DEPS)) += fate-filter-metadata-idet
+fate-filter-metadata-idet: CMD = run $(FILTER_METADATA_COMMAND) "testsrc2=s=720x288:r=50:d=0.4,weave[a];testsrc2=s=720x288:r=50:d=0.4,weave=bottom[b];testsrc2=s=720x576:r=25:d=0.4[c];[a][b][c]concat=n=3,format=yuv422p10le,crop=720:575:0:0,format=yuv422p10,idet"
 
 FREEZEDETECT_DEPS = LAVFI_INDEV MPTESTSRC_FILTER SCALE_FILTER FREEZEDETECT_FILTER
 FATE_METADATA_FILTER-$(call ALLYES, $(FREEZEDETECT_DEPS)) += fate-filter-metadata-freezedetect
