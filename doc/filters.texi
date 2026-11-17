@@ -28559,6 +28559,79 @@ ffmpeg -init_hw_device vulkan=vk:0,disable_multiplane=1 -filter_hw_device vk \
   -c:v hevc_nvenc -profile:v main10 OUTPUT
 @end example
 
+@section vsr_cuda
+
+Scale, denoise or deblur video with NVIDIA RTX Video Super Resolution, an AI
+based upscaler.
+
+The input must be CUDA frames in @code{rgba} or @code{rgb0} format; the output
+has the same format, which @code{hevc_nvenc} and the other NVENC encoders take
+directly. Colour properties are passed through unchanged.
+
+This filter requires Windows and an NVIDIA RTX GPU. The RTX Video SDK is not
+linked; it is loaded at runtime through @file{NVEncNVSDKNGX.dll}, which needs
+@file{nvngx_vsr.dll} and @file{cudart64_12.dll}. Place all three next to the
+executable.
+
+It accepts the following parameters:
+
+@table @option
+@item w
+@item h
+Output width and height, as expressions. They accept the same constants and
+the same @samp{-1}/@samp{-n} values as the @ref{scale} filter. Default is the
+input size.
+
+@item force_original_aspect_ratio
+@item force_divisible_by
+Work as in the @ref{scale} filter.
+
+@item quality
+The VSR mode (NVIDIA's @code{QualityLevel}). It accepts a number or one of the
+following names. Default is @samp{low} (1).
+@table @samp
+@item bicubic
+0: bicubic scaling, not AI, for comparison.
+@item low, medium, high, ultra
+1 to 4: upscaling, from fastest to best.
+@item denoise_low, denoise_medium, denoise_high, denoise_ultra
+8 to 11: denoising, from weakest to strongest. These do not scale, so the
+output size must equal the input size.
+@item deblur_low, deblur_medium, deblur_high, deblur_ultra
+12 to 15: deblurring, from weakest to strongest. These do not scale either.
+@item highbitrate_low, highbitrate_medium, highbitrate_high, highbitrate_ultra
+16 to 19: upscaling for high bitrate sources.
+@item streaming_medium, streaming_ultra
+21 and 23: upscaling for streamed sources. They need an Ampere or newer GPU.
+@end table
+Values 0 and 8 to 19 need @file{nvngx_vsr.dll} from VFX SDK 1.2 or later, and
+21 and 23 need 1.3 or later. 5 to 7, 20 and 22 are reserved by NVIDIA.
+
+@item strength
+Strength of the effect, from 0.0 to 1.0. Default is 1.0. Ignored by
+@file{nvngx_vsr.dll} older than VFX SDK 1.3.
+@end table
+
+@subsection Examples
+
+@itemize
+@item
+Decode with NVDEC, upscale to 4K and encode:
+@example
+ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i INPUT \
+  -vf "scale_cuda=format=rgba,vsr_cuda=w=3840:h=2160:quality=ultra" \
+  -c:v hevc_nvenc OUTPUT
+@end example
+
+@item
+Upscale to 4K, then convert to HDR10 with @code{truehdr_cuda}:
+@example
+ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i INPUT \
+  -vf "scale_cuda=format=rgba,vsr_cuda=w=3840:h=2160,truehdr_cuda" \
+  -c:v hevc_nvenc -profile:v main10 OUTPUT
+@end example
+@end itemize
+
 @section yadif_cuda
 
 Deinterlace the input video using the @ref{yadif} algorithm, but implemented
