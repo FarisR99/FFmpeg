@@ -583,7 +583,8 @@ OBJS-$(CONFIG_VPP_AMF_FILTER)                += vf_vpp_amf.o scale_eval.o vf_amf
 OBJS-$(CONFIG_FRC_AMF_FILTER)                += vf_frc_amf.o vf_amf_common.o
 OBJS-$(CONFIG_VQE_AMF_FILTER)                += vf_vqe_amf.o vf_amf_common.o
 OBJS-$(CONFIG_VPP_QSV_FILTER)                += vf_vpp_qsv.o
-OBJS-$(CONFIG_VSR_CUDA_FILTER)               += vf_vsr_cuda.o scale_eval.o
+OBJS-$(CONFIG_VSR_CUDA_FILTER)               += vf_vsr_cuda.o vf_vsr_cuda.ptx.o scale_eval.o \
+                                                cuda/load_helper.o
 OBJS-$(CONFIG_VSTACK_FILTER)                 += vf_stack.o framesync.o
 OBJS-$(CONFIG_W3FDIF_FILTER)                 += vf_w3fdif.o
 OBJS-$(CONFIG_WAVEFORM_FILTER)               += vf_waveform.o

@@ -28599,9 +28599,17 @@ ffmpeg -init_hw_device vulkan=vk:0,disable_multiplane=1 -filter_hw_device vk \
 Scale, denoise or deblur video with NVIDIA RTX Video Super Resolution, an AI
 based upscaler.
 
-The input must be CUDA frames in @code{rgba} or @code{rgb0} format; the output
-has the same format, which @code{hevc_nvenc} and the other NVENC encoders take
-directly. Colour properties are passed through unchanged.
+The input must be CUDA frames in @code{nv12}, @code{p010}, @code{rgba},
+@code{rgb0}, @code{bgra} or @code{bgr0} format. VSR itself works on 8-bit
+RGBA, so other formats are converted to it and back with CUDA kernels; the
+output has the input's format unless @option{format} is set. @code{p010} keeps
+its format but goes through 8 bits per component inside the filter.
+
+YCbCr input is converted with its tagged matrix, range and chroma location;
+untagged input is treated as BT.601 limited range with left-sited chroma, as
+in @ref{scale_cuda}. YCbCr output keeps the input's colour description, or,
+from RGB input, uses the negotiated one (BT.601 limited range and left-sited
+chroma by default).
 
 This filter requires Windows and an NVIDIA RTX GPU. The RTX Video SDK is not
 linked; it is loaded at runtime through @file{NVEncNVSDKNGX.dll}, which needs
@@ -28620,6 +28628,10 @@ input size.
 @item force_original_aspect_ratio
 @item force_divisible_by
 Work as in the @ref{scale} filter.
+
+@item format
+Output pixel format, one of the input formats listed above. Default is the
+input's format.
 
 @item quality
 The VSR mode (NVIDIA's @code{QualityLevel}). It accepts a number or one of the
@@ -28654,15 +28666,15 @@ Strength of the effect, from 0.0 to 1.0. Default is 1.0. Ignored by
 Decode with NVDEC, upscale to 4K and encode:
 @example
 ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i INPUT \
-  -vf "scale_cuda=format=rgba,vsr_cuda=w=3840:h=2160:quality=ultra" \
-  -c:v hevc_nvenc OUTPUT
+  -vf "vsr_cuda=w=3840:h=2160:quality=ultra" -c:v hevc_nvenc OUTPUT
 @end example
 
 @item
-Upscale to 4K, then convert to HDR10 with @code{truehdr_cuda}:
+Upscale to 4K, then convert to HDR10 with @code{truehdr_cuda}, which takes
+RGBA:
 @example
 ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i INPUT \
-  -vf "scale_cuda=format=rgba,vsr_cuda=w=3840:h=2160,truehdr_cuda" \
+  -vf "vsr_cuda=w=3840:h=2160:format=rgba,truehdr_cuda" \
   -c:v hevc_nvenc -profile:v main10 OUTPUT
 @end example
 @end itemize
