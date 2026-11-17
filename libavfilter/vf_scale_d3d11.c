@@ -33,11 +33,23 @@
 #include "scale_eval.h"
 #include "video.h"
 
+/* NVIDIA's video processor extension for RTX Video Super Resolution, as used
+ * by Chromium (ui/gl/swap_chain_presenter.cc) and mpv's d3d11vpp. */
+DEFINE_GUID(ff_nvidia_ppe_interface_guid,
+            0xd43ce1b3, 0x1f4b, 0x48ac, 0xba, 0xee,
+            0xc3, 0xc2, 0x53, 0x75, 0xe6, 0xf7);
+
+enum ScalingMode {
+    SCALING_STANDARD,
+    SCALING_NVIDIA,
+};
+
 typedef struct ScaleD3D11Context {
     const AVClass *classCtx;
     char *w_expr;
     char *h_expr;
     enum AVPixelFormat format;
+    int scaling_mode;
 
     ///< D3D11 objects
     ID3D11Device *device;
@@ -84,6 +96,32 @@ static void release_d3d11_resources(ScaleD3D11Context *s) {
         s->videoDevice->lpVtbl->Release(s->videoDevice);
         s->videoDevice = NULL;
     }
+}
+
+static int enable_nvidia_vsr(ScaleD3D11Context *s, AVFilterContext *ctx,
+                             ID3D11VideoContext *videoContext)
+{
+    struct {
+        UINT version;
+        UINT method;
+        UINT enable;
+    } ext = { 1, 2, 1 };
+    HRESULT hr;
+
+    /* Keep the driver's own automatic processing from altering the image. */
+    videoContext->lpVtbl->VideoProcessorSetStreamAutoProcessingMode(videoContext, s->processor, 0, FALSE);
+
+    hr = videoContext->lpVtbl->VideoProcessorSetStreamExtension(videoContext, s->processor, 0,
+                                                                &ff_nvidia_ppe_interface_guid,
+                                                                sizeof(ext), &ext);
+    if (FAILED(hr)) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to enable NVIDIA RTX Video Super Resolution "
+               "(HRESULT 0x%lX); it needs an NVIDIA RTX GPU.\n", hr);
+        return AVERROR(ENOSYS);
+    }
+
+    av_log(ctx, AV_LOG_VERBOSE, "NVIDIA RTX Video Super Resolution enabled\n");
+    return 0;
 }
 
 static int scale_d3d11_configure_processor(ScaleD3D11Context *s, AVFilterContext *ctx) {
@@ -150,6 +188,14 @@ static int scale_d3d11_configure_processor(ScaleD3D11Context *s, AVFilterContext
     }
     RECT src_rect = { 0, 0, s->inputWidth, s->inputHeight };
     videoContext->lpVtbl->VideoProcessorSetStreamSourceRect(videoContext, s->processor, 0, TRUE, &src_rect);
+
+    if (s->scaling_mode == SCALING_NVIDIA) {
+        int ret = enable_nvidia_vsr(s, ctx, videoContext);
+        if (ret < 0) {
+            videoContext->lpVtbl->Release(videoContext);
+            return ret;
+        }
+    }
     videoContext->lpVtbl->Release(videoContext);
 
     av_log(ctx, AV_LOG_VERBOSE, "D3D11 video processor successfully configured\n");
@@ -478,6 +524,9 @@ static const AVOption scale_d3d11_options[] = {
     { "width",  "Output video width",  OFFSET(w_expr), AV_OPT_TYPE_STRING, {.str = "iw"}, .flags = FLAGS },
     { "height", "Output video height", OFFSET(h_expr), AV_OPT_TYPE_STRING, {.str = "ih"}, .flags = FLAGS },
     { "format", "Output video pixel format", OFFSET(format), AV_OPT_TYPE_PIXEL_FMT, { .i64 = AV_PIX_FMT_NONE }, INT_MIN, INT_MAX, .flags=FLAGS },
+    { "scaling_mode", "Scaling method", OFFSET(scaling_mode), AV_OPT_TYPE_INT, { .i64 = SCALING_STANDARD }, 0, SCALING_NVIDIA, FLAGS, .unit = "scaling_mode" },
+        { "standard", "Driver default scaling",            0, AV_OPT_TYPE_CONST, { .i64 = SCALING_STANDARD }, 0, 0, FLAGS, .unit = "scaling_mode" },
+        { "nvidia",   "NVIDIA RTX Video Super Resolution", 0, AV_OPT_TYPE_CONST, { .i64 = SCALING_NVIDIA   }, 0, 0, FLAGS, .unit = "scaling_mode" },
     { NULL }
 };
 

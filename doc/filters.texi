@@ -22406,6 +22406,41 @@ If the specified expression is not valid, it is kept at its current
 value.
 @end table
 
+@section scale_d3d11
+
+Scale the input video with the Direct3D 11 video processor. Input and output
+are D3D11 frames.
+
+It accepts the following options:
+
+@table @option
+@item width
+@item height
+Output width and height, as expressions. Default is the input size.
+
+@item format
+Output pixel format, @code{nv12} or @code{p010}. It must be set.
+
+@item scaling_mode
+@table @samp
+@item standard
+The driver's default scaling. This is the default.
+@item nvidia
+NVIDIA RTX Video Super Resolution, an AI based upscaler built into the driver.
+It needs an NVIDIA RTX GPU, and only applies when upscaling. The driver
+picks the quality level from its own RTX Video settings.
+@end table
+@end table
+
+@subsection Example
+
+Decode with D3D11VA, upscale to 4K with RTX Video Super Resolution and encode:
+@example
+ffmpeg -hwaccel d3d11va -hwaccel_output_format d3d11 -i INPUT \
+  -vf "scale_d3d11=width=3840:height=2160:format=nv12:scaling_mode=nvidia" \
+  -c:v hevc_nvenc OUTPUT
+@end example
+
 @section scale_d3d12
 
 Scale (resize) and convert the pixel format of the input video using
