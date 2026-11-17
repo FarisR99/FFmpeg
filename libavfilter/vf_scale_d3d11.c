@@ -313,6 +313,48 @@ fail:
     return ret;
 }
 
+/**
+ * Each output frame is its own texture (a dynamic pool): NVIDIA's driver
+ * rejects NV12/P010 texture arrays without D3D11_BIND_DECODER, and the output
+ * view is always created on array slice 0. A test allocation checks that the
+ * driver accepts the bind flags, since a dynamic pool creates textures lazily.
+ */
+static int init_output_frames(ScaleD3D11Context *s, UINT bind_flags)
+{
+    AVHWFramesContext *frames_ctx;
+    AVD3D11VAFramesContext *frames_hwctx;
+    AVFrame *test;
+    int ret;
+
+    av_buffer_unref(&s->hw_frames_ctx_out);
+    s->hw_frames_ctx_out = av_hwframe_ctx_alloc(s->hw_device_ctx);
+    if (!s->hw_frames_ctx_out)
+        return AVERROR(ENOMEM);
+
+    frames_ctx = (AVHWFramesContext *)s->hw_frames_ctx_out->data;
+    frames_ctx->format    = AV_PIX_FMT_D3D11;
+    frames_ctx->sw_format = s->format;
+    frames_ctx->width     = s->width;
+    frames_ctx->height    = s->height;
+
+    frames_hwctx = frames_ctx->hwctx;
+    frames_hwctx->MiscFlags = 0;
+    frames_hwctx->BindFlags = bind_flags;
+
+    ret = av_hwframe_ctx_init(s->hw_frames_ctx_out);
+    if (ret >= 0) {
+        test = av_frame_alloc();
+        if (!test)
+            ret = AVERROR(ENOMEM);
+        else
+            ret = av_hwframe_get_buffer(s->hw_frames_ctx_out, test, 0);
+        av_frame_free(&test);
+    }
+    if (ret < 0)
+        av_buffer_unref(&s->hw_frames_ctx_out);
+    return ret;
+}
+
 static int scale_d3d11_config_props(AVFilterLink *outlink)
 {
     AVFilterContext *ctx = outlink->src;
@@ -363,28 +405,15 @@ static int scale_d3d11_config_props(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
-    ///< Create new hardware frames context for output
-    s->hw_frames_ctx_out = av_hwframe_ctx_alloc(s->hw_device_ctx);
-    if (!s->hw_frames_ctx_out)
-        return AVERROR(ENOMEM);
-
-    AVHWFramesContext *frames_ctx = (AVHWFramesContext *)s->hw_frames_ctx_out->data;
-    frames_ctx->format = AV_PIX_FMT_D3D11;
-    frames_ctx->sw_format = s->format;
-    frames_ctx->width = s->width;
-    frames_ctx->height = s->height;
-    frames_ctx->initial_pool_size = 10;
-
-    if (ctx->extra_hw_frames > 0)
-        frames_ctx->initial_pool_size += ctx->extra_hw_frames;
-
-    AVD3D11VAFramesContext *frames_hwctx = frames_ctx->hwctx;
-    frames_hwctx->MiscFlags = 0;
-    frames_hwctx->BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER;
-
-    ret = av_hwframe_ctx_init(s->hw_frames_ctx_out);
+    ///< Create new hardware frames context for output. Some drivers (NVIDIA)
+    ///< reject the video encoder bind flag for P010, so fall back without it.
+    ret = init_output_frames(s, D3D11_BIND_RENDER_TARGET | D3D11_BIND_VIDEO_ENCODER);
     if (ret < 0) {
-        av_buffer_unref(&s->hw_frames_ctx_out);
+        av_log(ctx, AV_LOG_VERBOSE, "Output frames without D3D11_BIND_VIDEO_ENCODER\n");
+        ret = init_output_frames(s, D3D11_BIND_RENDER_TARGET);
+    }
+    if (ret < 0) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to create output frames\n");
         return ret;
     }
 
