@@ -141,6 +141,17 @@ static int scale_d3d11_configure_processor(ScaleD3D11Context *s, AVFilterContext
         return AVERROR_EXTERNAL;
     }
 
+    ///< Read only the picture, not the padding below or right of it
+    ID3D11VideoContext *videoContext = NULL;
+    hr = s->context->lpVtbl->QueryInterface(s->context, &IID_ID3D11VideoContext, (void **)&videoContext);
+    if (FAILED(hr)) {
+        av_log(ctx, AV_LOG_ERROR, "Failed to get video context: HRESULT 0x%lX\n", hr);
+        return AVERROR_EXTERNAL;
+    }
+    RECT src_rect = { 0, 0, s->inputWidth, s->inputHeight };
+    videoContext->lpVtbl->VideoProcessorSetStreamSourceRect(videoContext, s->processor, 0, TRUE, &src_rect);
+    videoContext->lpVtbl->Release(videoContext);
+
     av_log(ctx, AV_LOG_VERBOSE, "D3D11 video processor successfully configured\n");
     return 0;
 }
@@ -202,13 +213,15 @@ static int scale_d3d11_filter_frame(AVFilterLink *inlink, AVFrame *in)
 
     ///< Configure the D3D11 video processor if not already configured
     if (!s->processor) {
-        ///< Get info from input texture
+        ///< Get the format from the input texture. Its size can include
+        ///< decoder padding (e.g. 1920x1088 or 1920x1152 for 1080p), so the
+        ///< picture size comes from the frame.
         D3D11_TEXTURE2D_DESC textureDesc;
         ID3D11Texture2D *input_texture = (ID3D11Texture2D *)in->data[0];
         input_texture->lpVtbl->GetDesc(input_texture, &textureDesc);
 
-        s->inputWidth = textureDesc.Width;
-        s->inputHeight = textureDesc.Height;
+        s->inputWidth = in->width;
+        s->inputHeight = in->height;
         s->input_format = textureDesc.Format;
 
         ret = scale_d3d11_configure_processor(s, ctx);
