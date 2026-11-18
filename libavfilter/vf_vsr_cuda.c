@@ -97,6 +97,8 @@ typedef struct VSRCUDAContext {
     int quality;
     float strength;
     enum AVPixelFormat format;
+    int opt_color_matrix;   /* out_color_matrix: AVColorSpace, or unspecified */
+    int opt_range;          /* out_range: AVColorRange, or unspecified */
 
     AVCUDADeviceContext *hwctx;
     AVBufferRef *frames_ctx;
@@ -119,9 +121,26 @@ typedef struct VSRCUDAContext {
     FFNGX ngx;
 } VSRCUDAContext;
 
+/* The YCbCr matrices the conversion kernels implement. */
+static int matrix_is_supported(enum AVColorSpace csp)
+{
+    return av_csp_luma_coeffs_from_avcsp(csp) &&
+           csp != AVCOL_SPC_RGB       && csp != AVCOL_SPC_BT2020_CL &&
+           csp != AVCOL_SPC_YCGCO     && csp != AVCOL_SPC_YCGCO_RE &&
+           csp != AVCOL_SPC_YCGCO_RO  && csp != AVCOL_SPC_ICTCP &&
+           csp != AVCOL_SPC_IPT_C2;
+}
+
 static av_cold int vsr_init(AVFilterContext *ctx)
 {
     VSRCUDAContext *s = ctx->priv;
+
+    if (s->opt_color_matrix != AVCOL_SPC_UNSPECIFIED &&
+        !matrix_is_supported(s->opt_color_matrix)) {
+        av_log(ctx, AV_LOG_ERROR, "Unsupported out_color_matrix %s.\n",
+               av_color_space_name(s->opt_color_matrix));
+        return AVERROR(EINVAL);
+    }
 
     if ((s->quality >= 5 && s->quality <= 7) || s->quality == 20 ||
         s->quality == 22) {
@@ -181,12 +200,20 @@ static enum VSRConv format_conv(enum AVPixelFormat fmt)
     }
 }
 
+/*
+ * The matrices YUV output can have. Negotiation picks the first one when
+ * nothing narrows the list, as for RGB input, so BT.601 comes first, as in
+ * scale_cuda.
+ */
 static AVFilterFormats *yuv_color_spaces(void)
 {
     AVFilterFormats *ret = NULL;
 
+    if (ff_add_format(&ret, AVCOL_SPC_SMPTE170M) < 0 ||
+        ff_add_format(&ret, AVCOL_SPC_UNSPECIFIED) < 0)
+        return NULL;
     for (int csp = 0; csp < AVCOL_SPC_NB; csp++) {
-        if (csp == AVCOL_SPC_RGB || csp == AVCOL_SPC_RESERVED)
+        if (csp == AVCOL_SPC_SMPTE170M || !matrix_is_supported(csp))
             continue;
         if (ff_add_format(&ret, csp) < 0)
             return NULL;
@@ -220,19 +247,25 @@ static int vsr_query_formats(const AVFilterContext *ctx,
         (ret = ff_formats_ref(ff_all_chroma_locations(), &cfg_in[0]->chroma_locations)) < 0)
         return ret;
 
-    if (out_conv == CONV_YUV)
-        formats = yuv_color_spaces();
-    else if (out_conv >= 0)
+    /* out_color_matrix and out_range are checked against the output format
+     * in config_props, when it is known. */
+    if (out_conv != CONV_YUV && out_conv >= 0)
         formats = ff_make_formats_list_singleton(AVCOL_SPC_RGB);
+    else if (s->opt_color_matrix != AVCOL_SPC_UNSPECIFIED)
+        formats = ff_make_formats_list_singleton(s->opt_color_matrix);
+    else if (out_conv == CONV_YUV)
+        formats = yuv_color_spaces();
     else
         formats = ff_all_color_spaces();
     if ((ret = ff_formats_ref(formats, &cfg_out[0]->color_spaces)) < 0)
         return ret;
 
-    if (out_conv == CONV_YUV)
-        formats = ff_make_format_list(yuv_ranges);
-    else if (out_conv >= 0)
+    if (out_conv != CONV_YUV && out_conv >= 0)
         formats = ff_make_format_list(rgb_ranges);
+    else if (s->opt_range != AVCOL_RANGE_UNSPECIFIED)
+        formats = ff_make_formats_list_singleton(s->opt_range);
+    else if (out_conv == CONV_YUV)
+        formats = ff_make_format_list(yuv_ranges);
     else
         formats = ff_all_color_ranges();
     if ((ret = ff_formats_ref(formats, &cfg_out[0]->color_ranges)) < 0)
@@ -277,15 +310,12 @@ static int set_yuv_params(AVFilterContext *ctx, VSRConvParams *p, int to_rgb,
 
     if (csp == AVCOL_SPC_UNSPECIFIED)
         csp = AVCOL_SPC_SMPTE170M;
-    coeffs = av_csp_luma_coeffs_from_avcsp(csp);
-    if (!coeffs || csp == AVCOL_SPC_RGB || csp == AVCOL_SPC_BT2020_CL ||
-        csp == AVCOL_SPC_YCGCO || csp == AVCOL_SPC_YCGCO_RE ||
-        csp == AVCOL_SPC_YCGCO_RO || csp == AVCOL_SPC_ICTCP ||
-        csp == AVCOL_SPC_IPT_C2) {
+    if (!matrix_is_supported(csp)) {
         av_log(ctx, AV_LOG_ERROR, "Unsupported YCbCr matrix %s.\n",
                av_color_space_name(csp));
         return AVERROR(ENOSYS);
     }
+    coeffs = av_csp_luma_coeffs_from_avcsp(csp);
     kr = av_q2d(coeffs->cr);
     kg = av_q2d(coeffs->cg);
     kb = av_q2d(coeffs->cb);
@@ -357,6 +387,13 @@ static av_cold int vsr_config_props(AVFilterLink *outlink)
     }
     s->in_conv  = format_conv(s->in_fmt);
     s->out_conv = format_conv(s->out_fmt);
+    if (s->out_conv != CONV_YUV &&
+        (s->opt_color_matrix != AVCOL_SPC_UNSPECIFIED ||
+         s->opt_range != AVCOL_RANGE_UNSPECIFIED)) {
+        av_log(ctx, AV_LOG_ERROR, "out_color_matrix and out_range need nv12 "
+               "or p010 output, not %s.\n", av_get_pix_fmt_name(s->out_fmt));
+        return AVERROR(EINVAL);
+    }
 
     if ((ret = ff_scale_eval_dimensions(s, s->w_expr, s->h_expr,
                                         inlink, outlink, &w, &h)) < 0)
@@ -615,7 +652,12 @@ static int vsr_filter_frame(AVFilterLink *inlink, AVFrame *in)
     ret = av_frame_copy_props(out, in);
     if (ret < 0)
         goto fail;
-    out->sample_aspect_ratio = outlink->sample_aspect_ratio;
+    /* From the frame, as in scale_cuda, in case it differs from the link. */
+    if (in->sample_aspect_ratio.num)
+        av_reduce(&out->sample_aspect_ratio.num, &out->sample_aspect_ratio.den,
+                  (int64_t)in->sample_aspect_ratio.num * outlink->h * inlink->w,
+                  (int64_t)in->sample_aspect_ratio.den * outlink->w * inlink->h,
+                  INT_MAX);
     if (s->in_conv == CONV_YUV || s->out_conv == CONV_YUV) {
         out->colorspace      = s->out_csp;
         out->color_range     = s->out_range;
@@ -663,6 +705,25 @@ static const AVOption vsr_cuda_options[] = {
         { "streaming_medium",  "for streamed sources",              0, AV_OPT_TYPE_CONST, { .i64 = VSR_STREAMING_MEDIUM  }, 0, 0, FLAGS, .unit = "quality" },
         { "streaming_ultra",   NULL,                                0, AV_OPT_TYPE_CONST, { .i64 = VSR_STREAMING_ULTRA   }, 0, 0, FLAGS, .unit = "quality" },
     { "strength", "strength of the effect", OFFSET(strength), AV_OPT_TYPE_FLOAT, { .dbl = 1.0 }, 0.0, 1.0, FLAGS },
+    { "out_range", "output color range (nv12/p010)", OFFSET(opt_range), AV_OPT_TYPE_INT, { .i64 = AVCOL_RANGE_UNSPECIFIED }, AVCOL_RANGE_UNSPECIFIED, AVCOL_RANGE_JPEG, FLAGS, .unit = "range" },
+        { "auto",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_UNSPECIFIED }, 0, 0, FLAGS, .unit = "range" },
+        { "full",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG },        0, 0, FLAGS, .unit = "range" },
+        { "limited", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG },        0, 0, FLAGS, .unit = "range" },
+        { "jpeg",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG },        0, 0, FLAGS, .unit = "range" },
+        { "mpeg",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG },        0, 0, FLAGS, .unit = "range" },
+        { "tv",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_MPEG },        0, 0, FLAGS, .unit = "range" },
+        { "pc",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_RANGE_JPEG },        0, 0, FLAGS, .unit = "range" },
+    { "out_color_matrix", "output YCbCr matrix (nv12/p010)", OFFSET(opt_color_matrix), AV_OPT_TYPE_INT, { .i64 = AVCOL_SPC_UNSPECIFIED }, 0, AVCOL_SPC_NB - 1, FLAGS, .unit = "color" },
+        { "auto",      NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_UNSPECIFIED }, 0, 0, FLAGS, .unit = "color" },
+        { "bt601",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_SMPTE170M },   0, 0, FLAGS, .unit = "color" },
+        { "smpte170m", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_SMPTE170M },   0, 0, FLAGS, .unit = "color" },
+        { "bt470",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT470BG },     0, 0, FLAGS, .unit = "color" },
+        { "bt470bg",   NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT470BG },     0, 0, FLAGS, .unit = "color" },
+        { "bt709",     NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT709 },       0, 0, FLAGS, .unit = "color" },
+        { "fcc",       NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_FCC },         0, 0, FLAGS, .unit = "color" },
+        { "smpte240m", NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_SMPTE240M },   0, 0, FLAGS, .unit = "color" },
+        { "bt2020",    NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT2020_NCL },  0, 0, FLAGS, .unit = "color" },
+        { "bt2020nc",  NULL, 0, AV_OPT_TYPE_CONST, { .i64 = AVCOL_SPC_BT2020_NCL },  0, 0, FLAGS, .unit = "color" },
     { NULL }
 };
 

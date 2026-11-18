@@ -28621,7 +28621,11 @@ YCbCr input is converted with its tagged matrix, range and chroma location;
 untagged input is treated as BT.601 limited range with left-sited chroma, as
 in @ref{scale_cuda}. YCbCr output keeps the input's colour description, or,
 from RGB input, uses the negotiated one (BT.601 limited range and left-sited
-chroma by default).
+chroma by default). @option{out_color_matrix} and @option{out_range} set it
+explicitly.
+
+VSR's output is opaque: the alpha of @code{rgba} and @code{bgra} input is not
+kept.
 
 This filter requires Windows and an NVIDIA RTX GPU. The RTX Video SDK is not
 linked; it is loaded at runtime through @file{NVEncNVSDKNGX.dll}, which needs
@@ -28669,6 +28673,16 @@ Values 0 and 8 to 19 need @file{nvngx_vsr.dll} from VFX SDK 1.2 or later, and
 @item strength
 Strength of the effect, from 0.0 to 1.0. Default is 1.0. Ignored by
 @file{nvngx_vsr.dll} older than VFX SDK 1.3.
+
+@item out_color_matrix
+YCbCr matrix of @code{nv12} or @code{p010} output: @samp{auto} (default),
+@samp{bt601}, @samp{bt470bg}, @samp{bt709}, @samp{fcc}, @samp{smpte240m} or
+@samp{bt2020}. With YCbCr input, a different matrix converts the colours.
+
+@item out_range
+Range of @code{nv12} or @code{p010} output: @samp{auto} (default),
+@samp{limited} (@samp{tv}, @samp{mpeg}) or @samp{full} (@samp{pc},
+@samp{jpeg}).
 @end table
 
 @subsection Examples
@@ -28688,6 +28702,12 @@ RGBA:
 ffmpeg -hwaccel cuda -hwaccel_output_format cuda -i INPUT \
   -vf "vsr_cuda=w=3840:h=2160:format=rgba,truehdr_cuda" \
   -c:v hevc_nvenc -profile:v main10 OUTPUT
+@end example
+
+@item
+Upscale RGB frames and output BT.709 NV12 for the encoder:
+@example
+vsr_cuda=w=3840:h=2160:format=nv12:out_color_matrix=bt709
 @end example
 @end itemize
 
