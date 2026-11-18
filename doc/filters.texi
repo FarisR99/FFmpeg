@@ -22431,7 +22431,8 @@ It accepts the following options:
 Output width and height, as expressions. Default is the input size.
 
 @item format
-Output pixel format, @code{nv12} or @code{p010}. It must be set.
+Output pixel format, @code{nv12} or @code{p010}. Default is the input's
+format.
 
 @item scaling_mode
 @table @samp

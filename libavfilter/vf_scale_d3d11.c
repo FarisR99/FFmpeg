@@ -442,6 +442,10 @@ static int scale_d3d11_config_props(AVFilterLink *outlink)
         return AVERROR(EINVAL);
     }
 
+    ///< Without a format option, keep the input's (NV12 or P010)
+    if (s->format == AV_PIX_FMT_NONE)
+        s->format = ((AVHWFramesContext *)inl->hw_frames_ctx->data)->sw_format;
+
     ///< Initialize filter's hardware device context
     if (!s->hw_device_ctx) {
         AVHWFramesContext *in_frames_ctx = (AVHWFramesContext *)inl->hw_frames_ctx->data;
