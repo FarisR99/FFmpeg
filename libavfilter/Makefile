@@ -558,7 +558,7 @@ OBJS-$(CONFIG_TRANSPOSE_VT_FILTER)           += vf_transpose_vt.o
 OBJS-$(CONFIG_TRANSPOSE_VULKAN_FILTER)       += vf_transpose_vulkan.o vulkan.o vulkan_filter.o
 OBJS-$(CONFIG_TRIM_FILTER)                   += trim.o
 OBJS-$(CONFIG_TRUEHDR_CUDA_FILTER)           += vf_truehdr_cuda.o vf_truehdr_cuda.ptx.o \
-                                                cuda/load_helper.o
+                                                cuda/load_helper.o cuda/ngx.o
 OBJS-$(CONFIG_UNPREMULTIPLY_FILTER)          += vf_premultiply.o framesync.o
 OBJS-$(CONFIG_UNSHARP_FILTER)                += vf_unsharp.o
 OBJS-$(CONFIG_UNSHARP_OPENCL_FILTER)         += vf_unsharp_opencl.o opencl.o \
@@ -584,7 +584,7 @@ OBJS-$(CONFIG_FRC_AMF_FILTER)                += vf_frc_amf.o vf_amf_common.o
 OBJS-$(CONFIG_VQE_AMF_FILTER)                += vf_vqe_amf.o vf_amf_common.o
 OBJS-$(CONFIG_VPP_QSV_FILTER)                += vf_vpp_qsv.o
 OBJS-$(CONFIG_VSR_CUDA_FILTER)               += vf_vsr_cuda.o vf_vsr_cuda.ptx.o scale_eval.o \
-                                                cuda/load_helper.o
+                                                cuda/load_helper.o cuda/ngx.o
 OBJS-$(CONFIG_VSTACK_FILTER)                 += vf_stack.o framesync.o
 OBJS-$(CONFIG_W3FDIF_FILTER)                 += vf_w3fdif.o
 OBJS-$(CONFIG_WAVEFORM_FILTER)               += vf_waveform.o
@@ -693,6 +693,7 @@ SKIPHEADERS-$(CONFIG_OPENCL)                 += opencl.h
 SKIPHEADERS-$(CONFIG_VAAPI)                  += vaapi_vpp.h stack_internal.h
 SKIPHEADERS-$(CONFIG_VULKAN)                 += vulkan_filter.h
 SKIPHEADERS-$(CONFIG_SCALE_CUDA_FILTER)      += vf_scale_cuda.h
+SKIPHEADERS-$(HAVE_LOADLIBRARY)              += cuda/ngx.h
 
 TOOLS     = graph2dot
 TESTPROGS = drawutils filtfmts formats integral

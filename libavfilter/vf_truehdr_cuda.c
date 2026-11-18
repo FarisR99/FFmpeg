@@ -28,8 +28,6 @@
 
 #include "config.h"
 
-#include "compat/w32dlfcn.h"
-
 #include "libavutil/common.h"
 #include "libavutil/cuda_check.h"
 #include "libavutil/hwcontext.h"
@@ -43,6 +41,7 @@
 #include "formats.h"
 
 #include "cuda/load_helper.h"
+#include "cuda/ngx.h"
 
 #define CHECK_CU(x) FF_CUDA_CHECK_DL(ctx, s->hwctx->internal->cuda_dl, x)
 #define DIV_UP(a, b) (((a) + (b) - 1) / (b))
@@ -51,34 +50,6 @@
 
 /* TrueHDR's linear output has 1.0 at 100 nits. */
 #define TRUEHDR_LINEAR_NITS 100.0f
-
-/* The C API of NVEncNVSDKNGX.dll. The functions return 0 on success. */
-#define NGX_DLL_NAME "NVEncNVSDKNGX.dll"
-#define NGX_FEATURE_TRUEHDR 2
-
-typedef struct NGXRect {
-    int left, top, right, bottom;
-} NGXRect;
-
-typedef struct NGXTrueHDRParams {
-    uint32_t contrast;
-    uint32_t saturation;
-    uint32_t middle_gray;
-    uint32_t max_luminance;
-} NGXTrueHDRParams;
-
-typedef int  (__stdcall *ngx_create_fn)(void **handle, int feature);
-typedef int  (__stdcall *ngx_init_fn)(void *handle, int cuda_device_ordinal,
-                                      void *cu_context, void *cu_stream);
-typedef void (__stdcall *ngx_delete_fn)(void *handle);
-typedef int  (__stdcall *ngx_proc_frame_fn)(void *handle,
-                                            const NGXRect *rect_dst,
-                                            const NGXRect *rect_src,
-                                            const void *params,
-                                            const void *src, int src_pitch,
-                                            void *dst, int dst_pitch,
-                                            int src_bytes_per_pixel,
-                                            int dst_bytes_per_pixel);
 
 /* Must match TrueHDRConvParams in vf_truehdr_cuda.cu. */
 typedef struct TrueHDRConvParams {
@@ -107,12 +78,7 @@ typedef struct TrueHDRCUDAContext {
     size_t hdr_pitch;
     TrueHDRConvParams conv;
 
-    HMODULE dll;
-    ngx_create_fn ngx_create;
-    ngx_init_fn ngx_init;
-    ngx_delete_fn ngx_delete;
-    ngx_proc_frame_fn ngx_proc_frame;
-    void *ngx;
+    FFNGX ngx;
 } TrueHDRCUDAContext;
 
 static av_cold void truehdr_uninit(AVFilterContext *ctx)
@@ -125,8 +91,7 @@ static av_cold void truehdr_uninit(AVFilterContext *ctx)
 
         CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
         CHECK_CU(cu->cuCtxSynchronize());
-        if (s->ngx)
-            s->ngx_delete(s->ngx);
+        ff_ngx_close(&s->ngx);
         if (s->hdr_buf)
             CHECK_CU(cu->cuMemFree(s->hdr_buf));
         if (s->ev_in)
@@ -137,15 +102,9 @@ static av_cold void truehdr_uninit(AVFilterContext *ctx)
             CHECK_CU(cu->cuModuleUnload(s->cu_module));
         CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     }
-    s->ngx = NULL;
     s->hdr_buf = 0;
     s->ev_in = s->ev_out = NULL;
     s->cu_module = NULL;
-
-    /* Unloading also resets the DLL's once-per-process NGX initialization. */
-    if (s->dll)
-        dlclose(s->dll);
-    s->dll = NULL;
 
     av_buffer_unref(&s->frames_ctx);
 }
@@ -169,49 +128,6 @@ static int truehdr_query_formats(const AVFilterContext *ctx,
         (ret = ff_formats_ref(ff_make_formats_list_singleton(AVCOL_RANGE_MPEG),
                               &cfg_out[0]->color_ranges)) < 0)
         return ret;
-    return 0;
-}
-
-static av_cold int load_ngx(AVFilterContext *ctx)
-{
-    TrueHDRCUDAContext *s = ctx->priv;
-    int err;
-
-    s->dll = dlopen(NGX_DLL_NAME, 0);
-    if (!s->dll) {
-        av_log(ctx, AV_LOG_ERROR, "Could not load " NGX_DLL_NAME ". Place it, "
-               "nvngx_truehdr.dll and cudart64_12.dll next to ffmpeg.\n");
-        return AVERROR_EXTERNAL;
-    }
-
-#define LOAD(field, type, name) do {                                        \
-        s->field = (type)dlsym(s->dll, name);                               \
-        if (!s->field) {                                                    \
-            av_log(ctx, AV_LOG_ERROR, NGX_DLL_NAME " has no %s.\n", name); \
-            return AVERROR_EXTERNAL;                                        \
-        }                                                                   \
-    } while (0)
-    LOAD(ngx_create,     ngx_create_fn,     "NVEncNVSDKNGXCreate");
-    LOAD(ngx_init,       ngx_init_fn,       "NVEncNVSDKNGXInit");
-    LOAD(ngx_delete,     ngx_delete_fn,     "NVEncNVSDKNGXDelete");
-    LOAD(ngx_proc_frame, ngx_proc_frame_fn, "NVEncNVSDKNGXProcFrame");
-#undef LOAD
-
-    err = s->ngx_create(&s->ngx, NGX_FEATURE_TRUEHDR);
-    if (err || !s->ngx) {
-        av_log(ctx, AV_LOG_ERROR, "Could not create TrueHDR (error %d).\n", err);
-        s->ngx = NULL;
-        return AVERROR_EXTERNAL;
-    }
-
-    /* The DLL copies frames on the context's legacy default stream, so its
-     * evaluation goes there too. The caller has the context current. */
-    err = s->ngx_init(s->ngx, -1, s->hwctx->cuda_ctx, NULL);
-    if (err) {
-        av_log(ctx, AV_LOG_ERROR, "Could not initialize TrueHDR (error %d). "
-               "It requires nvngx_truehdr.dll and an RTX GPU.\n", err);
-        return AVERROR_EXTERNAL;
-    }
     return 0;
 }
 
@@ -355,7 +271,8 @@ static av_cold int truehdr_config_props(AVFilterLink *outlink)
             ret = CHECK_CU(cu->cuEventCreate(&s->ev_out, CU_EVENT_DISABLE_TIMING));
     }
     if (ret >= 0)
-        ret = load_ngx(ctx);
+        ret = ff_ngx_open(ctx, &s->ngx, FF_NGX_FEATURE_TRUEHDR, "TrueHDR",
+                          "nvngx_truehdr.dll", s->hwctx->cuda_ctx);
 
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     return ret;
@@ -367,8 +284,8 @@ static int truehdr_filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterLink *outlink = ctx->outputs[0];
     TrueHDRCUDAContext *s = ctx->priv;
     CudaFunctions *cu = s->hwctx->internal->cuda_dl;
-    const NGXRect rect = { 0, 0, inlink->w, inlink->h };
-    const NGXTrueHDRParams params = {
+    const FFNGXRect rect = { 0, 0, inlink->w, inlink->h };
+    const FFNGXTrueHDRParams params = {
         .contrast      = s->contrast,
         .saturation    = s->saturation,
         .middle_gray   = s->middle_gray,
@@ -406,7 +323,7 @@ static int truehdr_filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     if (ret >= 0) {
-        err = s->ngx_proc_frame(s->ngx, &rect, &rect, &params,
+        err = s->ngx.proc_frame(s->ngx.handle, &rect, &rect, &params,
                                 in->data[0], in->linesize[0],
                                 (void *)(uintptr_t)s->hdr_buf, s->hdr_pitch,
                                 4, 8);

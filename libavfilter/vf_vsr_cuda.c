@@ -28,8 +28,6 @@
 
 #include "config.h"
 
-#include "compat/w32dlfcn.h"
-
 #include "libavutil/common.h"
 #include "libavutil/csp.h"
 #include "libavutil/cuda_check.h"
@@ -44,37 +42,12 @@
 #include "scale_eval.h"
 
 #include "cuda/load_helper.h"
+#include "cuda/ngx.h"
 
 #define CHECK_CU(x) FF_CUDA_CHECK_DL(ctx, s->hwctx->internal->cuda_dl, x)
 #define DIV_UP(a, b) (((a) + (b) - 1) / (b))
 #define BLOCKX 32
 #define BLOCKY 8
-
-/* The C API of NVEncNVSDKNGX.dll. The functions return 0 on success. */
-#define NGX_DLL_NAME "NVEncNVSDKNGX.dll"
-#define NGX_FEATURE_VSR 1
-
-typedef struct NGXRect {
-    int left, top, right, bottom;
-} NGXRect;
-
-typedef struct NGXVSRParams {
-    int quality;
-    float strength;
-} NGXVSRParams;
-
-typedef int  (__stdcall *ngx_create_fn)(void **handle, int feature);
-typedef int  (__stdcall *ngx_init_fn)(void *handle, int cuda_device_ordinal,
-                                      void *cu_context, void *cu_stream);
-typedef void (__stdcall *ngx_delete_fn)(void *handle);
-typedef int  (__stdcall *ngx_proc_frame_fn)(void *handle,
-                                            const NGXRect *rect_dst,
-                                            const NGXRect *rect_src,
-                                            const void *params,
-                                            const void *src, int src_pitch,
-                                            void *dst, int dst_pitch,
-                                            int src_bytes_per_pixel,
-                                            int dst_bytes_per_pixel);
 
 /* NVSDK_NGX_VSR_QualityLevel values. */
 enum VSRQuality {
@@ -143,12 +116,7 @@ typedef struct VSRCUDAContext {
     CUdeviceptr rgba_in, rgba_out;
     size_t rgba_in_pitch, rgba_out_pitch;
 
-    HMODULE dll;
-    ngx_create_fn ngx_create;
-    ngx_init_fn ngx_init;
-    ngx_delete_fn ngx_delete;
-    ngx_proc_frame_fn ngx_proc_frame;
-    void *ngx;
+    FFNGX ngx;
 } VSRCUDAContext;
 
 static av_cold int vsr_init(AVFilterContext *ctx)
@@ -174,8 +142,7 @@ static av_cold void vsr_uninit(AVFilterContext *ctx)
 
         CHECK_CU(cu->cuCtxPushCurrent(s->hwctx->cuda_ctx));
         CHECK_CU(cu->cuCtxSynchronize());
-        if (s->ngx)
-            s->ngx_delete(s->ngx);
+        ff_ngx_close(&s->ngx);
         if (s->rgba_in)
             CHECK_CU(cu->cuMemFree(s->rgba_in));
         if (s->rgba_out)
@@ -188,15 +155,9 @@ static av_cold void vsr_uninit(AVFilterContext *ctx)
             CHECK_CU(cu->cuModuleUnload(s->cu_module));
         CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     }
-    s->ngx = NULL;
     s->rgba_in = s->rgba_out = 0;
     s->ev_in = s->ev_out = NULL;
     s->cu_module = NULL;
-
-    /* Unloading also resets the DLL's once-per-process NGX initialization. */
-    if (s->dll)
-        dlclose(s->dll);
-    s->dll = NULL;
 
     av_buffer_unref(&s->frames_ctx);
 }
@@ -281,49 +242,6 @@ static int vsr_query_formats(const AVFilterContext *ctx,
               ff_all_chroma_locations() :
               ff_make_formats_list_singleton(AVCHROMA_LOC_UNSPECIFIED);
     return ff_formats_ref(formats, &cfg_out[0]->chroma_locations);
-}
-
-static av_cold int load_ngx(AVFilterContext *ctx)
-{
-    VSRCUDAContext *s = ctx->priv;
-    int err;
-
-    s->dll = dlopen(NGX_DLL_NAME, 0);
-    if (!s->dll) {
-        av_log(ctx, AV_LOG_ERROR, "Could not load " NGX_DLL_NAME ". Place it, "
-               "nvngx_vsr.dll and cudart64_12.dll next to ffmpeg.\n");
-        return AVERROR_EXTERNAL;
-    }
-
-#define LOAD(field, type, name) do {                                        \
-        s->field = (type)dlsym(s->dll, name);                               \
-        if (!s->field) {                                                    \
-            av_log(ctx, AV_LOG_ERROR, NGX_DLL_NAME " has no %s.\n", name); \
-            return AVERROR_EXTERNAL;                                        \
-        }                                                                   \
-    } while (0)
-    LOAD(ngx_create,     ngx_create_fn,     "NVEncNVSDKNGXCreate");
-    LOAD(ngx_init,       ngx_init_fn,       "NVEncNVSDKNGXInit");
-    LOAD(ngx_delete,     ngx_delete_fn,     "NVEncNVSDKNGXDelete");
-    LOAD(ngx_proc_frame, ngx_proc_frame_fn, "NVEncNVSDKNGXProcFrame");
-#undef LOAD
-
-    err = s->ngx_create(&s->ngx, NGX_FEATURE_VSR);
-    if (err || !s->ngx) {
-        av_log(ctx, AV_LOG_ERROR, "Could not create VSR (error %d).\n", err);
-        s->ngx = NULL;
-        return AVERROR_EXTERNAL;
-    }
-
-    /* The DLL copies frames on the context's legacy default stream, so its
-     * evaluation goes there too. The caller has the context current. */
-    err = s->ngx_init(s->ngx, -1, s->hwctx->cuda_ctx, NULL);
-    if (err) {
-        av_log(ctx, AV_LOG_ERROR, "Could not initialize VSR (error %d). "
-               "It requires nvngx_vsr.dll and an RTX GPU.\n", err);
-        return AVERROR_EXTERNAL;
-    }
-    return 0;
 }
 
 /* Chroma sample position within a 2x2 luma block. */
@@ -552,7 +470,8 @@ static av_cold int vsr_config_props(AVFilterLink *outlink)
             ret = CHECK_CU(cu->cuEventCreate(&s->ev_out, CU_EVENT_DISABLE_TIMING));
     }
     if (ret >= 0)
-        ret = load_ngx(ctx);
+        ret = ff_ngx_open(ctx, &s->ngx, FF_NGX_FEATURE_VSR, "VSR",
+                          "nvngx_vsr.dll", s->hwctx->cuda_ctx);
 
     CHECK_CU(cu->cuCtxPopCurrent(&dummy));
     if (ret < 0)
@@ -619,9 +538,9 @@ static int vsr_filter_frame(AVFilterLink *inlink, AVFrame *in)
     AVFilterLink *outlink = ctx->outputs[0];
     VSRCUDAContext *s = ctx->priv;
     CudaFunctions *cu = s->hwctx->internal->cuda_dl;
-    const NGXRect rect_src = { 0, 0, inlink->w, inlink->h };
-    const NGXRect rect_dst = { 0, 0, outlink->w, outlink->h };
-    const NGXVSRParams params = {
+    const FFNGXRect rect_src = { 0, 0, inlink->w, inlink->h };
+    const FFNGXRect rect_dst = { 0, 0, outlink->w, outlink->h };
+    const FFNGXVSRParams params = {
         .quality  = s->quality,
         .strength = s->strength,
     };
@@ -672,7 +591,7 @@ static int vsr_filter_frame(AVFilterLink *inlink, AVFrame *in)
     }
 
     if (ret >= 0) {
-        err = s->ngx_proc_frame(s->ngx, &rect_dst, &rect_src, &params,
+        err = s->ngx.proc_frame(s->ngx.handle, &rect_dst, &rect_src, &params,
                                 vsr_src, vsr_src_pitch, vsr_dst, vsr_dst_pitch, 4, 4);
         if (err) {
             av_log(ctx, AV_LOG_ERROR, "VSR failed (error %d).\n", err);
