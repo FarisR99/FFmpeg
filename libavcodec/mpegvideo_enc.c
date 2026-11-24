@@ -1200,6 +1200,17 @@ static void mpv_reconstruct_mb(MPVEncContext *const s, int16_t block[12][64])
                 if (s->c.chroma_y_shift) {
                     put_dct(s, block[4], 4, dest_cb, uvlinesize, s->c.chroma_qscale);
                     put_dct(s, block[5], 5, dest_cr, uvlinesize, s->c.chroma_qscale);
+                } else if (!s->c.chroma_x_shift) {
+                    const int uv_dct_linesize = uvlinesize << s->c.interlaced_dct;
+                    const int uv_dct_offset   = s->c.interlaced_dct ? uvlinesize : uvlinesize * block_size;
+                    put_dct(s, block[ 4],  4, dest_cb,                              uv_dct_linesize, s->c.chroma_qscale);
+                    put_dct(s, block[ 5],  5, dest_cr,                              uv_dct_linesize, s->c.chroma_qscale);
+                    put_dct(s, block[ 6],  6, dest_cb + block_size,                 uv_dct_linesize, s->c.chroma_qscale);
+                    put_dct(s, block[ 7],  7, dest_cr + block_size,                 uv_dct_linesize, s->c.chroma_qscale);
+                    put_dct(s, block[ 8],  8, dest_cb + uv_dct_offset,              uv_dct_linesize, s->c.chroma_qscale);
+                    put_dct(s, block[ 9],  9, dest_cr + uv_dct_offset,              uv_dct_linesize, s->c.chroma_qscale);
+                    put_dct(s, block[10], 10, dest_cb + uv_dct_offset + block_size, uv_dct_linesize, s->c.chroma_qscale);
+                    put_dct(s, block[11], 11, dest_cr + uv_dct_offset + block_size, uv_dct_linesize, s->c.chroma_qscale);
                 } else {
                     dct_offset   >>= 1;
                     dct_linesize >>= 1;
@@ -2532,13 +2543,20 @@ static av_always_inline void encode_mb_internal(MPVEncContext *const s,
             get_visual_weight(weight[4], ptr_cb                , wrap_c);
         if (!skip_dct[5])
             get_visual_weight(weight[5], ptr_cr                , wrap_c);
-        if (!chroma_y_shift) { /* 422 */
+        if (chroma_format == CHROMA_422) {
             if (!skip_dct[6])
                 get_visual_weight(weight[6], ptr_cb + uv_dct_offset,
                                   wrap_c);
             if (!skip_dct[7])
                 get_visual_weight(weight[7], ptr_cr + uv_dct_offset,
                                   wrap_c);
+        } else if (chroma_format == CHROMA_444) {
+            for (i = 6; i < 12; i++) {
+                const uint8_t *ptr = i & 1 ? ptr_cr : ptr_cb;
+                if (!skip_dct[i])
+                    get_visual_weight(weight[i], ptr + (i >= 8) * uv_dct_offset +
+                                      ((i >> 1) & 1) * 8, wrap_c);
+            }
         }
         memcpy(orig[0], s->block[0], sizeof(int16_t) * 64 * mb_block_count);
     }
@@ -2968,6 +2986,7 @@ int ff_mpv_reallocate_putbitbuffer(MPVEncContext *const s, size_t threshold, siz
 
 static int encode_thread(AVCodecContext *c, void *arg){
     MPVEncContext *const s = *(void**)arg;
+    int chr_w = 16 >> s->c.chroma_x_shift;
     int chr_h = 16 >> s->c.chroma_y_shift;
     int i;
     MBBackup best_s = { 0 }, backup_s;
@@ -3579,11 +3598,11 @@ static int encode_thread(AVCodecContext *c, void *arg){
                     s, s->new_pic->data[0] + s->c.mb_x*16 + s->c.mb_y*s->c.linesize*16,
                     s->c.dest[0], w, h, s->c.linesize);
                 s->encoding_error[1] += sse(
-                    s, s->new_pic->data[1] + s->c.mb_x*8  + s->c.mb_y*s->c.uvlinesize*chr_h,
-                    s->c.dest[1], w>>1, h>>s->c.chroma_y_shift, s->c.uvlinesize);
+                    s, s->new_pic->data[1] + s->c.mb_x*chr_w + s->c.mb_y*s->c.uvlinesize*chr_h,
+                    s->c.dest[1], w>>s->c.chroma_x_shift, h>>s->c.chroma_y_shift, s->c.uvlinesize);
                 s->encoding_error[2] += sse(
-                    s, s->new_pic->data[2] + s->c.mb_x*8  + s->c.mb_y*s->c.uvlinesize*chr_h,
-                    s->c.dest[2], w>>1, h>>s->c.chroma_y_shift, s->c.uvlinesize);
+                    s, s->new_pic->data[2] + s->c.mb_x*chr_w + s->c.mb_y*s->c.uvlinesize*chr_h,
+                    s->c.dest[2], w>>s->c.chroma_x_shift, h>>s->c.chroma_y_shift, s->c.uvlinesize);
             }
             if (s->loop_filter) {
                 if (CONFIG_H263_ENCODER && s->c.out_format == FMT_H263)

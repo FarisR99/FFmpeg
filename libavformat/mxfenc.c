@@ -105,6 +105,7 @@ typedef struct MXFStreamContext {
     int index;               ///< index in mxf_essence_container_uls table
     const UID *codec_ul;
     const UID *container_ul;
+    UID clip_container_ul;   ///< clip wrapping essence container ul, used by OPAtom
     int order;               ///< interleaving order if dts are equal
     int interlaced;          ///< whether picture is interlaced
     int field_dominance;     ///< tff=1, bff=2
@@ -125,6 +126,12 @@ typedef struct MXFStreamContext {
     enum MXFMetadataSetType sub_descriptor;
     const UID *picture_descriptor_key;
     int cid;                 ///< compression id, used by dnxhd
+    int color_warned;        ///< unsupported color properties have been reported
+    /* color properties found in the essence bitstream, unspecified if absent */
+    enum AVColorPrimaries color_primaries;
+    enum AVColorTransferCharacteristic color_trc;
+    enum AVColorSpace color_space;
+    enum AVColorRange color_range;
 } MXFStreamContext;
 
 typedef struct MXFContainerEssenceEntry {
@@ -471,7 +478,6 @@ typedef struct MXFContext {
     MXFIndexEntry *index_entries;
     unsigned edit_units_count;
     uint64_t timestamp;   ///< timestamp, as year(16),month(8),day(8),hour(8),minutes(8),msec/4(8)
-    uint8_t slice_count;  ///< index slice count minus 1 (1 if no audio, 0 otherwise)
     int last_indexed_edit_unit;
     uint64_t *body_partition_offset;
     unsigned body_partitions_count;
@@ -555,10 +561,9 @@ static void klv_encode_ber4_length(AVIOContext *pb, int len)
     avio_wb24(pb, len);
 }
 
-static void klv_encode_ber9_length(AVIOContext *pb, uint64_t len)
+static void klv_encode_ber8_length(AVIOContext *pb, uint64_t len)
 {
-    avio_w8(pb, 0x80 + 8);
-    avio_wb64(pb, len);
+    avio_wb64(pb, (UINT64_C(0x87) << 56) | (len & UINT64_C(0x00FFFFFFFFFFFFFF)));
 }
 
 /*
@@ -739,7 +744,7 @@ static void mxf_write_essence_container_refs(AVFormatContext *s)
     for (i = 0; i < s->nb_streams; i++) {
         MXFStreamContext *sc = s->streams[i]->priv_data;
         // check first track of essence container type and only write it once
-        if (sc->track_essence_element_key[15] != 0)
+        if (sc->track_essence_element_key[15] != (sc->index == INDEX_S436M))
             continue;
         avio_write(pb, *sc->container_ul, 16);
         if (c->essence_container_count == 1)
@@ -748,6 +753,20 @@ static void mxf_write_essence_container_refs(AVFormatContext *s)
 
     if (c->essence_container_count > 1)
         avio_write(pb, multiple_desc_ul, 16);
+}
+
+static void mxf_write_operational_pattern(AVFormatContext *s)
+{
+    AVIOContext *pb = s->pb;
+
+    if (IS_OPATOM(s)) {
+        avio_write(pb, opatom_ul, 16);
+    } else {
+        avio_write(pb, op1a_ul, 14);
+        // qualifiers, ST 378 6.4: multi-track if more than one essence track
+        avio_w8(pb, s->nb_streams > 1 ? 0x09 : 0x01);
+        avio_w8(pb, op1a_ul[15]);
+    }
 }
 
 static void mxf_write_preface(AVFormatContext *s)
@@ -787,18 +806,15 @@ static void mxf_write_preface(AVFormatContext *s)
 
     // operational pattern
     mxf_write_local_tag(s, 16, 0x3B09);
-    if (IS_OPATOM(s))
-        avio_write(pb, opatom_ul, 16);
-    else
-        avio_write(pb, op1a_ul, 16);
+    mxf_write_operational_pattern(s);
 
     // write essence_container_refs
     mxf_write_local_tag(s, 8 + 16LL * DESCRIPTOR_COUNT(mxf->essence_container_count), 0x3B0A);
     mxf_write_essence_container_refs(s);
 
-    // write dm_scheme_refs
+    // write dm_scheme_refs, empty batch of ULs
     mxf_write_local_tag(s, 8, 0x3B0B);
-    avio_wb64(pb, 0);
+    mxf_write_refs_count(pb, 0);
 }
 
 /*
@@ -1229,6 +1245,11 @@ static inline uint32_t rescale_mastering_luma(AVRational q)
     return av_rescale(q.num, FF_MXF_MASTERING_LUMA_DEN, q.den);
 }
 
+static const char *color_name(const char *name)
+{
+    return name ? name : "reserved";
+}
+
 static int64_t mxf_write_generic_picture_desc(AVFormatContext *s, AVStream *st)
 {
     MXFStreamContext *sc = st->priv_data;
@@ -1246,9 +1267,32 @@ static int64_t mxf_write_generic_picture_desc(AVFormatContext *s, AVStream *st)
     const AVPacketSideData *side_data;
     int component_depth = pix_desc->comp[0].depth;
 
-    color_primaries_ul = mxf_get_codec_ul_by_id(ff_mxf_color_primaries_uls, st->codecpar->color_primaries);
-    color_trc_ul       = mxf_get_codec_ul_by_id(ff_mxf_color_trc_uls, st->codecpar->color_trc);
-    color_space_ul     = mxf_get_codec_ul_by_id(ff_mxf_color_space_uls, st->codecpar->color_space);
+    /* the essence bitstream takes precedence where it describes the color */
+    if (sc->color_primaries == AVCOL_PRI_UNSPECIFIED)
+        sc->color_primaries = st->codecpar->color_primaries;
+    if (sc->color_trc == AVCOL_TRC_UNSPECIFIED)
+        sc->color_trc = st->codecpar->color_trc;
+    if (sc->color_space == AVCOL_SPC_UNSPECIFIED)
+        sc->color_space = st->codecpar->color_space;
+    if (sc->color_range == AVCOL_RANGE_UNSPECIFIED)
+        sc->color_range = st->codecpar->color_range;
+
+    color_primaries_ul = mxf_get_codec_ul_by_id(ff_mxf_color_primaries_uls, sc->color_primaries);
+    color_trc_ul       = mxf_get_codec_ul_by_id(ff_mxf_color_trc_uls, sc->color_trc);
+    color_space_ul     = mxf_get_codec_ul_by_id(ff_mxf_color_space_uls, sc->color_space);
+
+    if (!sc->color_warned) {
+        if (!color_primaries_ul->uid[0] && sc->color_primaries != AVCOL_PRI_UNSPECIFIED)
+            av_log(s, AV_LOG_WARNING, "Color primaries %s have no MXF label, not writing them\n",
+                   color_name(av_color_primaries_name(sc->color_primaries)));
+        if (!color_trc_ul->uid[0] && sc->color_trc != AVCOL_TRC_UNSPECIFIED)
+            av_log(s, AV_LOG_WARNING, "Color transfer %s has no MXF label, not writing it\n",
+                   color_name(av_color_transfer_name(sc->color_trc)));
+        if (!color_space_ul->uid[0] && sc->color_space != AVCOL_SPC_UNSPECIFIED)
+            av_log(s, AV_LOG_WARNING, "Color matrix %s has no MXF label, not writing it\n",
+                   color_name(av_color_space_name(sc->color_space)));
+        sc->color_warned = 1;
+    }
 
     if (st->codecpar->codec_id == AV_CODEC_ID_DVVIDEO) {
         if (st->codecpar->height == 1080)
@@ -1395,11 +1439,11 @@ static int64_t mxf_write_generic_picture_desc(AVFormatContext *s, AVStream *st)
         mxf_write_local_tag(s, 2, 0x3307);
         avio_wb16(pb, 0);
 
-        if (st->codecpar->color_range != AVCOL_RANGE_UNSPECIFIED) {
+        if (sc->color_range != AVCOL_RANGE_UNSPECIFIED) {
             int black = 0,
                 white = (1<<component_depth) - 1,
                 color = (1<<component_depth);
-            if (st->codecpar->color_range == AVCOL_RANGE_MPEG) {
+            if (sc->color_range == AVCOL_RANGE_MPEG) {
                 black = 1   << (component_depth - 4);
                 white = 235 << (component_depth - 8);
                 color = (14 << (component_depth - 4)) + 1;
@@ -2011,6 +2055,33 @@ static unsigned klv_fill_size(uint64_t size)
         return pad & (KAG_SIZE-1);
 }
 
+/**
+ * Number of slices minus 1. Elements following the VBE picture are in slice 1,
+ * there should be no slices if the picture is the last element, ST 377-1 11.1.4.
+ */
+static int mxf_index_slice_count(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    return !mxf->edit_unit_byte_count && s->nb_streams > 1;
+}
+
+static int mxf_index_entry_size(AVFormatContext *s)
+{
+    return 11 + 4 * mxf_index_slice_count(s);
+}
+
+// largest IndexEntryArray fitting a 2 byte local set length
+static int mxf_index_max_entries(AVFormatContext *s)
+{
+    return (UINT16_MAX - 8) / mxf_index_entry_size(s);
+}
+
+static int mxf_index_delta_count(AVFormatContext *s)
+{
+    // one delta entry per element, plus the system item except in OPAtom
+    return s->nb_streams + !IS_OPATOM(s);
+}
+
 static int mxf_check_frame_offset(AVFormatContext *s, int offset)
 {
     if (offset >= INT8_MIN && offset <= INT8_MAX)
@@ -2023,30 +2094,28 @@ static int mxf_check_frame_offset(AVFormatContext *s, int offset)
     return AVERROR_PATCHWELCOME;
 }
 
-static int mxf_write_index_table_segment(AVFormatContext *s)
+// Fixed local tags and DeltaEntryArray, excluding the KLV key and length.
+static unsigned mxf_index_header_size(AVFormatContext *s)
+{
+    return 85 + 12 + 6 * mxf_index_delta_count(s);
+}
+
+static void mxf_write_index_table_segment_header(AVFormatContext *s, int64_t start, int duration)
 {
     MXFContext *mxf = s->priv_data;
     AVIOContext *pb = s->pb;
-    int i, j, temporal_reordering = 0;
-    int key_index = mxf->last_key_index;
-    int prev_non_b_picture = 0;
-    int audio_frame_size = 0;
-    int64_t pos;
-    int err;
+    unsigned element_delta = 0;
+    unsigned size = mxf_index_header_size(s);
+    int i;
 
-    av_log(s, AV_LOG_DEBUG, "edit units count %d\n", mxf->edit_units_count);
-
-    if (!mxf->edit_units_count && !mxf->edit_unit_byte_count)
-        return 0;
-
+    if (duration)
+        size += 12 + duration * mxf_index_entry_size(s);
     avio_write(pb, index_table_segment_key, 16);
-
-    klv_encode_ber4_length(pb, 0);
-    pos = avio_tell(pb);
+    klv_encode_ber4_length(pb, size);
 
     // instance id
     mxf_write_local_tag(s, 16, 0x3C0A);
-    mxf_write_uuid(pb, IndexTableSegment, mxf->last_indexed_edit_unit);
+    mxf_write_uuid(pb, IndexTableSegment, start);
 
     // index edit rate
     mxf_write_local_tag(s, 8, 0x3F0B);
@@ -2055,14 +2124,11 @@ static int mxf_write_index_table_segment(AVFormatContext *s)
 
     // index start position
     mxf_write_local_tag(s, 8, 0x3F0C);
-    avio_wb64(pb, mxf->last_indexed_edit_unit);
+    avio_wb64(pb, start);
 
-    // index duration
+    // index duration, 0 if the index table covers whole container
     mxf_write_local_tag(s, 8, 0x3F0D);
-    if (mxf->edit_unit_byte_count)
-        avio_wb64(pb, 0); // index table covers whole container
-    else
-        avio_wb64(pb, mxf->edit_units_count);
+    avio_wb64(pb, duration);
 
     // edit unit byte count
     mxf_write_local_tag(s, 4, 0x3F05);
@@ -2078,47 +2144,85 @@ static int mxf_write_index_table_segment(AVFormatContext *s)
 
     // real slice count - 1
     mxf_write_local_tag(s, 1, 0x3F08);
-    avio_w8(pb, !mxf->edit_unit_byte_count); // only one slice for CBR
+    avio_w8(pb, mxf_index_slice_count(s));
 
     // delta entry array
-    mxf_write_local_tag(s, 8 + (s->nb_streams+1)*6, 0x3F09);
-    avio_wb32(pb, s->nb_streams+1); // num of entries
+    mxf_write_local_tag(s, 8 + mxf_index_delta_count(s)*6, 0x3F09);
+    avio_wb32(pb, mxf_index_delta_count(s)); // num of entries
     avio_wb32(pb, 6);               // size of one entry
-    // write system item delta entry
-    avio_w8(pb, 0);
-    avio_w8(pb, 0); // slice entry
-    avio_wb32(pb, 0); // element delta
+    if (!IS_OPATOM(s)) {
+        // write system item delta entry
+        avio_w8(pb, 0);
+        avio_w8(pb, 0); // slice entry
+        avio_wb32(pb, 0); // element delta
+    }
     // write each stream delta entry
     for (i = 0; i < s->nb_streams; i++) {
         AVStream *st = s->streams[i];
         MXFStreamContext *sc = st->priv_data;
         avio_w8(pb, sc->temporal_reordering);
-        if (sc->temporal_reordering)
-            temporal_reordering = 1;
         if (mxf->edit_unit_byte_count) {
             avio_w8(pb, 0); // slice number
             avio_wb32(pb, sc->slice_offset);
         } else if (i == 0) { // video track
             avio_w8(pb, 0); // slice number
-            avio_wb32(pb, KAG_SIZE); // system item size including klv fill
+            // system item size including klv fill, no system item in OPAtom
+            avio_wb32(pb, IS_OPATOM(s) ? 0 : KAG_SIZE);
         } else { // audio or data track
-            if (!audio_frame_size) {
-                audio_frame_size = sc->frame_size;
-                audio_frame_size += klv_fill_size(audio_frame_size);
-            }
             avio_w8(pb, 1);
-            avio_wb32(pb, (i-1)*audio_frame_size); // element delta
+            avio_wb32(pb, element_delta);
+            // each element is KAG aligned and starts with its 16 byte key and 4 byte length
+            element_delta += 16 + 4 + sc->frame_size;
+            element_delta += klv_fill_size(element_delta);
         }
     }
+}
 
-    if (!mxf->edit_unit_byte_count) {
+static void mxf_write_klv_fill(AVFormatContext *s)
+{
+    unsigned pad = klv_fill_size(avio_tell(s->pb));
+    if (pad) {
+        avio_write(s->pb, klv_fill_key, 16);
+        pad -= 16 + 4;
+        klv_encode_ber4_length(s->pb, pad);
+        ffio_fill(s->pb, 0, pad);
+        av_assert1(!(avio_tell(s->pb) & (KAG_SIZE-1)));
+    }
+}
+
+static int mxf_write_index_table_segment(AVFormatContext *s)
+{
+    MXFContext *mxf = s->priv_data;
+    AVIOContext *pb = s->pb;
+    int i, j;
+    int key_index = mxf->last_key_index;
+    int prev_non_b_picture = 0;
+    int err;
+
+    av_log(s, AV_LOG_DEBUG, "edit units count %d\n", mxf->edit_units_count);
+
+    if (!mxf->edit_units_count && !mxf->edit_unit_byte_count)
+        return 0;
+
+    if (mxf->edit_unit_byte_count) {
+        mxf_write_index_table_segment_header(s, mxf->last_indexed_edit_unit, 0);
+    } else {
         MXFStreamContext *sc = s->streams[0]->priv_data;
-        mxf_write_local_tag(s, 8 + mxf->edit_units_count*15, 0x3F0A);
-        avio_wb32(pb, mxf->edit_units_count);  // num of entries
-        avio_wb32(pb, 15);  // size of one entry
 
         for (i = 0; i < mxf->edit_units_count; i++) {
             int temporal_offset = 0;
+
+            // split the index table so that each segment fits 2 byte local set lengths
+            if (!(i % mxf_index_max_entries(s))) {
+                int nb_entries = FFMIN(mxf->edit_units_count - i, mxf_index_max_entries(s));
+                if (i)
+                    mxf_write_klv_fill(s);
+                mxf_write_index_table_segment_header(s, mxf->last_indexed_edit_unit + i,
+                                                     nb_entries);
+                mxf_write_local_tag(s, 8 + nb_entries*mxf_index_entry_size(s), 0x3F0A);
+                avio_wb32(pb, nb_entries);           // num of entries
+                avio_wb32(pb, mxf_index_entry_size(s)); // size of one entry
+            }
 
             if (!(mxf->index_entries[i].flags & 0x33)) { // I-frame
                 sc->max_gop = FFMAX(sc->max_gop, i - mxf->last_key_index);
@@ -2126,7 +2230,7 @@ static int mxf_write_index_table_segment(AVFormatContext *s)
                 key_index = i;
             }
 
-            if (temporal_reordering) {
+            if (sc->temporal_reordering) {
                 int pic_num_in_gop = i - key_index;
                 if (pic_num_in_gop != mxf->index_entries[i].temporal_ref) {
                     for (j = key_index; j < mxf->edit_units_count; j++) {
@@ -2167,10 +2271,8 @@ static int mxf_write_index_table_segment(AVFormatContext *s)
             avio_w8(pb, mxf->index_entries[i].flags);
             // stream offset
             avio_wb64(pb, mxf->index_entries[i].offset);
-            if (s->nb_streams > 1)
+            if (mxf_index_slice_count(s))
                 avio_wb32(pb, mxf->index_entries[i].slice_offset);
-            else
-                avio_wb32(pb, 0);
         }
 
         mxf->last_key_index = key_index - mxf->edit_units_count;
@@ -2178,21 +2280,7 @@ static int mxf_write_index_table_segment(AVFormatContext *s)
         mxf->edit_units_count = 0;
     }
 
-    mxf_update_klv_size(pb, pos);
-
     return 0;
-}
-
-static void mxf_write_klv_fill(AVFormatContext *s)
-{
-    unsigned pad = klv_fill_size(avio_tell(s->pb));
-    if (pad) {
-        avio_write(s->pb, klv_fill_key, 16);
-        pad -= 16 + 4;
-        klv_encode_ber4_length(s->pb, pad);
-        ffio_fill(s->pb, 0, pad);
-        av_assert1(!(avio_tell(s->pb) & (KAG_SIZE-1)));
-    }
 }
 
 static int mxf_write_partition(AVFormatContext *s, int bodysid,
@@ -2202,20 +2290,24 @@ static int mxf_write_partition(AVFormatContext *s, int bodysid,
     MXFContext *mxf = s->priv_data;
     AVIOContext *pb = s->pb;
     int64_t header_byte_count_offset;
-    unsigned index_byte_count = 0;
+    uint64_t index_byte_count = 0;
     uint64_t partition_offset = avio_tell(pb);
     int err;
 
-    if (!mxf->edit_unit_byte_count && mxf->edit_units_count)
-        index_byte_count = 85 + 12+(s->nb_streams+1)*6 +
-            12+mxf->edit_units_count*15;
-    else if (mxf->edit_unit_byte_count && indexsid)
-        index_byte_count = 80;
+    if (!mxf->edit_unit_byte_count && mxf->edit_units_count) {
+        unsigned nb_segments = 1 + (mxf->edit_units_count - 1) / mxf_index_max_entries(s);
+        // key and ber4 length, fixed sets, delta and index entry arrays per segment
+        unsigned segment_header_size = 16 + 4 + mxf_index_header_size(s) + 12;
+        unsigned full_segment_size = segment_header_size + mxf_index_max_entries(s) * mxf_index_entry_size(s);
+        // segments are KAG aligned, the last one by the fill below
+        index_byte_count = (uint64_t)nb_segments * segment_header_size +
+                           (uint64_t)mxf->edit_units_count * mxf_index_entry_size(s) +
+                           (uint64_t)(nb_segments - 1) * klv_fill_size(full_segment_size);
+    } else if (mxf->edit_unit_byte_count && indexsid)
+        index_byte_count = 16 + 4 + mxf_index_header_size(s);
 
-    if (index_byte_count) {
-        index_byte_count += 16 + 4; // add encoded ber4 length
+    if (index_byte_count)
         index_byte_count += klv_fill_size(index_byte_count);
-    }
 
     if (key && !memcmp(key, body_partition_key, 16)) {
         if ((err = av_reallocp_array(&mxf->body_partition_offset, mxf->body_partitions_count + 1,
@@ -2267,10 +2359,7 @@ static int mxf_write_partition(AVFormatContext *s, int bodysid,
     avio_wb32(pb, bodysid); // bodySID
 
     // operational pattern
-    if (IS_OPATOM(s))
-        avio_write(pb, opatom_ul, 16);
-    else
-        avio_write(pb, op1a_ul, 16);
+    mxf_write_operational_pattern(s);
 
     // essence container
     mxf_write_essence_container_refs(s);
@@ -2330,6 +2419,21 @@ static int mxf_parse_prores_frame(AVFormatContext *s, AVStream *st, AVPacket *pk
     }
     if (i == FF_ARRAY_ELEMS(mxf_prores_codec_uls))
         return 0;
+
+    /* frame header color fields, SMPTE RDD 36 */
+    if (pkt->size >= 25 && AV_RL32(pkt->data + 4) == AV_RL32("icpf")) {
+        if (pkt->data[22]) // 0 is unknown
+            sc->color_primaries = pkt->data[22];
+        /* code 1 covers BT.601, BT.709 and BT.2020, keep a more precise stream value */
+        if (pkt->data[23] &&
+            (pkt->data[23] != AVCOL_TRC_BT709 ||
+             (st->codecpar->color_trc != AVCOL_TRC_SMPTE170M &&
+              st->codecpar->color_trc != AVCOL_TRC_BT2020_10 &&
+              st->codecpar->color_trc != AVCOL_TRC_BT2020_12)))
+            sc->color_trc = pkt->data[23];
+        if (pkt->data[24]) // 0 is unknown, not RGB
+            sc->color_space = pkt->data[24];
+    }
 
     sc->frame_size = pkt->size;
 
@@ -2562,6 +2666,15 @@ static int mxf_parse_h264_frame(AVFormatContext *s, AVStream *st,
                       sc->aspect_ratio.num, sc->aspect_ratio.den, 1024*1024);
             intra_only = (sps->constraint_set_flags >> 3) & 1;
             sc->interlaced = !sps->frame_mbs_only_flag;
+
+            if (sps->video_signal_type_present_flag) {
+                sc->color_range = sps->video_full_range_flag ? AVCOL_RANGE_JPEG : AVCOL_RANGE_MPEG;
+                if (sps->colour_description_present_flag) {
+                    sc->color_primaries = sps->colour_primaries;
+                    sc->color_trc       = sps->transfer_characteristics;
+                    sc->color_space     = sps->matrix_coefficients;
+                }
+            }
 
             buf = nal_end;
             break;
@@ -2799,6 +2912,7 @@ static const UID *mxf_get_mpeg2_codec_ul(AVCodecParameters *par)
 static int mxf_parse_mpeg2_frame(AVFormatContext *s, AVStream *st,
                                  AVPacket *pkt, MXFIndexEntry *e)
 {
+    MXFContext *mxf = s->priv_data;
     MXFStreamContext *sc = st->priv_data;
     uint32_t c = -1;
     int i;
@@ -2810,6 +2924,13 @@ static int mxf_parse_mpeg2_frame(AVFormatContext *s, AVStream *st,
                 st->codecpar->profile = pkt->data[i+1] & 0x07;
                 st->codecpar->level   = pkt->data[i+2] >> 4;
                 sc->low_delay = pkt->data[i+6] >> 7;
+            } else if (i + 4 < pkt->size && (pkt->data[i+1] & 0xf0) == 0x20) { // seq display ext
+                /* Header metadata must keep its size when rewritten. */
+                if (!mxf->header_written && (pkt->data[i+1] & 0x01)) { // colour_description
+                    sc->color_primaries = pkt->data[i+2];
+                    sc->color_trc       = pkt->data[i+3];
+                    sc->color_space     = pkt->data[i+4];
+                }
             } else if (i + 5 < pkt->size && (pkt->data[i+1] & 0xf0) == 0x80) { // pict coding ext
                 sc->interlaced = !(pkt->data[i+5] & 0x80); // progressive frame
                 if (sc->interlaced)
@@ -2951,9 +3072,22 @@ static int mxf_init(AVFormatContext *s)
     uint8_t present[FF_ARRAY_ELEMS(mxf_essence_container_uls)] = {0};
     int64_t timestamp = 0;
 
-    if (IS_OPATOM(s) && s->nb_streams != 1) {
-        av_log(s, AV_LOG_ERROR, "there must be exactly one stream for mxf opatom\n");
-        return -1;
+    if (IS_OPATOM(s)) {
+        const AVCodecParameters *par;
+
+        if (s->nb_streams != 1) {
+            av_log(s, AV_LOG_ERROR, "there must be exactly one stream for mxf opatom\n");
+            return -1;
+        }
+        par = s->streams[0]->codecpar;
+        // This muxer writes one clip KLV; ProRes and ANC mappings use frame elements.
+        if (par->codec_id == AV_CODEC_ID_PRORES ||
+            (par->codec_type != AVMEDIA_TYPE_VIDEO &&
+             par->codec_type != AVMEDIA_TYPE_AUDIO)) {
+            av_log(s, AV_LOG_ERROR, "%s is not supported in MXF OPAtom\n",
+                   avcodec_get_name(par->codec_id));
+            return AVERROR_PATCHWELCOME;
+        }
     }
 
     if (!av_dict_get(s->metadata, "comment_", NULL, AV_DICT_IGNORE_SUFFIX))
@@ -2971,6 +3105,10 @@ static int mxf_init(AVFormatContext *s)
             return AVERROR(ENOMEM);
         st->priv_data = sc;
         sc->index = -1;
+        sc->color_primaries = AVCOL_PRI_UNSPECIFIED;
+        sc->color_trc       = AVCOL_TRC_UNSPECIFIED;
+        sc->color_space     = AVCOL_SPC_UNSPECIFIED;
+        sc->color_range     = AVCOL_RANGE_UNSPECIFIED;
 
         if (((i == 0) ^ (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO)) && !IS_OPATOM(s)) {
             av_log(s, AV_LOG_ERROR, "there must be exactly one video stream and it must be the first one\n");
@@ -3088,7 +3226,6 @@ static int mxf_init(AVFormatContext *s)
                 mxf->edit_unit_byte_count = (av_get_bits_per_sample(st->codecpar->codec_id) * st->codecpar->ch_layout.nb_channels) >> 3;
                 sc->index = INDEX_WAV;
             } else {
-                mxf->slice_count = 1;
                 sc->frame_size = st->codecpar->ch_layout.nb_channels *
                                  av_rescale_rnd(st->codecpar->sample_rate, mxf->time_base.num, mxf->time_base.den, AV_ROUND_UP) *
                                  av_get_bits_per_sample(st->codecpar->codec_id) / 8;
@@ -3140,13 +3277,12 @@ static int mxf_init(AVFormatContext *s)
 
         memcpy(sc->track_essence_element_key, mxf_essence_container_uls[sc->index].element_ul, 15);
         sc->track_essence_element_key[15] = present[sc->index];
-        if (IS_OPATOM(s) && st->codecpar->codec_id == AV_CODEC_ID_DNXHD) {
-            // clip-wrapping requires 0x0D per ST2019-4:2009 or 0x06 per previous version ST2019-4:2008
-            // we choose to use 0x06 instead 0x0D to be compatible with AVID systems
-            // and produce mxf files with the most relevant flavour for opatom
-            sc->track_essence_element_key[14] = 0x06;
+        // ANC element numbers start at 1, ST 436-1
+        if (sc->index == INDEX_S436M)
+            sc->track_essence_element_key[15]++;
+        if (!IS_OPATOM(s)) {
+            PRINT_KEY(s, "track essence element key", sc->track_essence_element_key);
         }
-        PRINT_KEY(s, "track essence element key", sc->track_essence_element_key);
 
         if (!present[sc->index])
             mxf->essence_container_count++;
@@ -3285,7 +3421,47 @@ static int mxf_write_opatom_body_partition(AVFormatContext *s)
         return err;
     mxf_write_klv_fill(s);
     avio_write(pb, sc->track_essence_element_key, 16);
-    klv_encode_ber9_length(pb, mxf->body_offset);
+    // 8 byte BER length for clip wrapping, ST 381-3 7.2 and ST 382 6.5.5
+    klv_encode_ber8_length(pb, mxf->body_offset);
+    return 0;
+}
+
+/**
+ * OPAtom essence is written as a single clip wrapped KLV,
+ * use the clip wrapping essence container label and element type.
+ */
+static int mxf_opatom_clip_wrap(AVFormatContext *s)
+{
+    AVStream *st = s->streams[0];
+    MXFStreamContext *sc = st->priv_data;
+    int wrapping_byte, element_type;
+
+    switch (st->codecpar->codec_id) {
+    case AV_CODEC_ID_MPEG2VIDEO: // ST 381-1
+    case AV_CODEC_ID_H264:       // ST 381-3
+        wrapping_byte = 15; element_type = 0x06; break;
+    case AV_CODEC_ID_DVVIDEO:    // ST 383
+        wrapping_byte = 15; element_type = 0x02; break;
+    case AV_CODEC_ID_DNXHD:      // ST 2019-4
+        wrapping_byte = 14; element_type = 0x0D; break;
+    case AV_CODEC_ID_JPEG2000:   // ST 422
+        wrapping_byte = 14; element_type = 0x09; break;
+    case AV_CODEC_ID_FFV1:       // RDD 48
+        wrapping_byte = 14; element_type = 0x1E; break;
+    case AV_CODEC_ID_PCM_S16LE:  // ST 382
+    case AV_CODEC_ID_PCM_S24LE:
+        wrapping_byte = 14; element_type = 0x02; break;
+    default:
+        av_log(s, AV_LOG_ERROR, "%s has no clip wrapping essence container, not supported in OPAtom\n",
+               avcodec_get_name(st->codecpar->codec_id));
+        return AVERROR_PATCHWELCOME;
+    }
+
+    memcpy(sc->clip_container_ul, *sc->container_ul, 16);
+    sc->clip_container_ul[wrapping_byte] = 0x02;
+    sc->container_ul = &sc->clip_container_ul;
+    sc->track_essence_element_key[14] = element_type;
+    PRINT_KEY(s, "track essence element key", sc->track_essence_element_key);
     return 0;
 }
 
@@ -3297,6 +3473,9 @@ static int mxf_write_opatom_packet(AVFormatContext *s, AVPacket *pkt, MXFIndexEn
     int err;
 
     if (!mxf->header_written) {
+        if ((err = mxf_opatom_clip_wrap(s)) < 0)
+            return err;
+
         if ((err = mxf_write_partition(s, 0, 0, header_open_partition_key, 1)) < 0)
             return err;
         mxf_write_klv_fill(s);
@@ -3400,6 +3579,13 @@ static int mxf_write_packet(AVFormatContext *s, AVPacket *pkt)
             return -1;
         }
     }
+
+    // codecs without sequence headers: every key frame is a random access point
+    if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+        st->codecpar->codec_id != AV_CODEC_ID_MPEG2VIDEO &&
+        st->codecpar->codec_id != AV_CODEC_ID_H264 &&
+        pkt->flags & AV_PKT_FLAG_KEY)
+        ie.flags |= 0x80;
 
     if (mxf->cbr_index) {
         if (pkt->size != sc->frame_size && st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -3511,6 +3697,11 @@ static int mxf_write_footer(AVFormatContext *s)
         (IS_OPATOM(s) && !mxf->body_partition_offset)) {
         /* reason could be invalid options/not supported codec/out of memory */
         return AVERROR_UNKNOWN;
+    }
+
+    if (IS_OPATOM(s) && mxf->body_offset >= (UINT64_C(1) << 56)) {
+        av_log(s, AV_LOG_ERROR, "MXF OPAtom essence exceeds the 8-byte BER length limit\n");
+        return AVERROR(EFBIG);
     }
 
     mxf->duration = mxf->last_indexed_edit_unit + mxf->edit_units_count;
@@ -3826,7 +4017,6 @@ const FFOutputFormat ff_mxf_opatom_muxer = {
     .priv_data_size    = sizeof(MXFContext),
     .p.audio_codec     = AV_CODEC_ID_PCM_S16LE,
     .p.video_codec     = AV_CODEC_ID_DNXHD,
-    .p.subtitle_codec  = AV_CODEC_ID_EIA_608,
     .init              = mxf_init,
     .write_packet      = mxf_write_packet,
     .write_trailer     = mxf_write_footer,

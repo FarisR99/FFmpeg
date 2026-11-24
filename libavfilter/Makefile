@@ -698,6 +698,7 @@ SKIPHEADERS-$(HAVE_LOADLIBRARY)              += cuda/ngx.h
 TOOLS     = graph2dot
 TESTPROGS = drawutils filtfmts formats integral
 
+TESTPROGS-$(CONFIG_AMIX_FILTER)   += amix
 TESTPROGS-$(CONFIG_DRAWVG_FILTER) += drawvg
 
 TOOLS-$(CONFIG_LIBZMQ) += zmqsend

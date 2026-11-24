@@ -973,6 +973,16 @@ resolve(){
     eval $1=\$resolve_out
 }
 
+# removes the names of empty variables from the list
+drop_empty(){
+    drop_empty_out=
+    eval drop_empty_in=\$$1
+    for v in $drop_empty_in; do
+        eval test -n \"\$$v\" && drop_empty_out="$drop_empty_out$v "
+    done
+    eval $1=\$drop_empty_out
+}
+
 add_cppflags(){
     append CPPFLAGS "$@"
 }
@@ -2629,6 +2639,7 @@ TYPES_LIST="
     SecPkgContext_KeyingMaterialInfo
     socklen_t
     struct_addrinfo
+    struct_aom_roi_map_ref_frame
     struct_group_source_req
     struct_ip_mreq_source
     struct_ipv6_mreq
@@ -2775,6 +2786,7 @@ CONFIG_EXTRA="
     mss34dsp
     pixblockdsp
     qpeldsp
+    qpfile
     qsv
     qsvdec
     qsvenc
@@ -3803,7 +3815,7 @@ prores_videotoolbox_encoder_select="videotoolbox_encoder"
 libaom_av1_decoder_deps="libaom"
 libaom_av1_decoder_select="itut_t35"
 libaom_av1_encoder_deps="libaom"
-libaom_av1_encoder_select="extract_extradata_bsf dovi_rpuenc"
+libaom_av1_encoder_select="extract_extradata_bsf dovi_rpuenc qpfile"
 libaribb24_decoder_deps="libaribb24"
 libaribcaption_decoder_deps="libaribcaption"
 libastcenc_encoder_deps="libastcenc"
@@ -3862,7 +3874,7 @@ libspeex_encoder_select="audio_frame_queue"
 libsvtav1_encoder_deps="libsvtav1"
 libsvtjpegxs_encoder_deps="libsvtjpegxs"
 libsvtjpegxs_decoder_deps="libsvtjpegxs"
-libsvtav1_encoder_select="dovi_rpuenc"
+libsvtav1_encoder_select="dovi_rpuenc qpfile"
 libtheora_encoder_deps="libtheora"
 libtwolame_encoder_deps="libtwolame"
 libuavs3d_decoder_deps="libuavs3d"
@@ -3878,8 +3890,9 @@ libvvenc_encoder_deps="libvvenc"
 libwebp_encoder_deps="libwebp"
 libwebp_anim_encoder_deps="libwebp"
 libx262_encoder_deps="libx262"
+libx262_encoder_select="qpfile"
 libx264_encoder_deps="libx264"
-libx264_encoder_select="atsc_a53 golomb"
+libx264_encoder_select="atsc_a53 golomb qpfile"
 libx264rgb_encoder_deps="libx264"
 libx264rgb_encoder_select="libx264_encoder"
 libx265_encoder_deps="libx265"
@@ -3945,7 +3958,7 @@ ivf_muxer_select="av1_metadata_bsf vp9_superframe_bsf"
 jpeg_mpf_demuxer_select="mjpeg_parser"
 latm_muxer_select="aac_adtstoasc_bsf mpeg4audio"
 matroska_audio_muxer_select="matroska_muxer"
-matroska_demuxer_select="riffdec"
+matroska_demuxer_select="mpeg4audio riffdec"
 matroska_demuxer_suggest="bzlib zlib"
 matroska_muxer_select="iso_writer mpeg4audio riffenc aac_adtstoasc_bsf pgs_frame_merge_bsf vp9_superframe_bsf"
 mcc_demuxer_select="smpte_436m"
@@ -4358,6 +4371,7 @@ avdevice_suggest="libm stdatomic"
 avfilter_deps="avutil"
 avfilter_suggest="libm stdatomic zlib"
 avformat_deps="avcodec avutil"
+avformat_select="golomb"
 avformat_suggest="libm network zlib stdatomic"
 avutil_suggest="amf clock_gettime ffnvcodec gcrypt libm zlib libdrm libmfx opencl openssl user32 vaapi vulkan videotoolbox corefoundation corevideo coremedia bcrypt stdatomic"
 swresample_deps="avutil"
@@ -7271,6 +7285,7 @@ enabled jni               && { [ $target_os = "android" ] && check_headers jni.h
 enabled ladspa            && require_headers "ladspa.h dlfcn.h"
 enabled lcms2             && require_pkg_config lcms2 "lcms2 >= 2.13" lcms2.h cmsCreateContext
 enabled libaom            && require_pkg_config libaom "aom >= 2.0.0" aom/aom_codec.h aom_codec_version
+enabled libaom            && check_struct aom/aomcx.h "struct aom_roi_map" ref_frame
 enabled liboapv           && require_pkg_config liboapv "oapv >= 0.2.0.0" "oapv/oapv.h" oapve_encode
 enabled libaribb24        && { check_pkg_config libaribb24 "aribb24 > 1.0.3" "aribb24/aribb24.h" arib_instance_new ||
                                { enabled gpl && require_pkg_config libaribb24 aribb24 "aribb24/aribb24.h" arib_instance_new; } ||
@@ -8216,32 +8231,34 @@ if ! enabled_any memalign posix_memalign aligned_malloc; then
 fi
 
 flatten_extralibs(){
-    nested_entries=
     list_name=$1
     eval list=\$${1}
-    for entry in $list; do
-        entry_copy=$entry
-        resolve entry_copy
-        flat_entries=
-        for e in $entry_copy; do
-            case $e in
-                *_extralibs) nested_entries="$nested_entries$e ";;
-                          *) flat_entries="$flat_entries$e ";;
-            esac
+    flatten_all=
+    while test -n "$list"; do
+        flatten_all="$flatten_all$list "
+        nested_entries=
+        for entry in $list; do
+            eval test -n \"\$${entry}_flattened\" && continue
+            eval ${entry}_flattened=1
+            eval entry_value=\$$entry
+            flat_entries=
+            for e in $entry_value; do
+                case $e in
+                    *_extralibs) nested_entries="$nested_entries$e ";;
+                              *) flat_entries="$flat_entries$e ";;
+                esac
+            done
+            eval $entry="\$flat_entries"
         done
-        eval $entry="\$flat_entries"
+        list=$nested_entries
     done
-    append $list_name "$nested_entries"
-
-    resolve nested_entries
-    if test -n "$(filter '*_extralibs' $nested_entries)"; then
-        flatten_extralibs $list_name
-    fi
+    eval $list_name=\$flatten_all
 }
 
 flatten_extralibs_wrapper(){
     list_name=$1
     flatten_extralibs $list_name
+    drop_empty $list_name
     unique $list_name
     resolve $list_name
     eval $list_name=\$\(\$ldflags_filter \$$list_name\)
