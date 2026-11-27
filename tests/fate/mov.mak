@@ -315,11 +315,27 @@ FATE_MOV_FFMPEG_SAMPLES-$(call FRAMECRC, MOV, AV1, AV1_PARSER) \
                            += fate-mov-avif-demux-still-image-multiple-items
 fate-mov-avif-demux-still-image-multiple-items: CMD = framecrc -c:v av1 -i $(TARGET_SAMPLES)/avif/still_image_exif.avif -c:v copy
 
+# avif demuxing - still image with a single item described by multiple extents.
+FATE_MOV_FFMPEG_SAMPLES-$(call FRAMECRC, MOV, AV1, AV1_PARSER) \
+                           += fate-mov-avif-demux-still-image-multiple-extents
+fate-mov-avif-demux-still-image-multiple-extents: CMD = framecrc -c:v av1 -i $(TARGET_SAMPLES)/avif/still_image_multiple_extents.avif -c:v copy
+
 # avif demuxing - still image with multiple items forming two grids (color + alpha), which themselves are handled as an Alpha derived image
 FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call FRAMECRC, MOV, AV1, AV1_PARSER) \
                            += fate-mov-avif-demux-still-image-alpha-grid
 fate-mov-avif-demux-still-image-alpha-grid: CMD = stream_demux mov $(TARGET_SAMPLES)/avif/gain_map_alpha_grid.avif "-c:v av1" "-c:v copy -map 0:g:0 -map 0:g:1" \
   "-of compact -show_entries stream_group=index,id,nb_streams,type:stream_group_components:stream_group_disposition:stream_group_tags:stream_group_side_data:stream_group_stream=index,id:stream_group_stream_disposition:stream_group_stream_side_data_list"
+
+# avif demuxing - grid items whose single idat extent uses an implied length, plus an mdat image item whose extent also uses an implied length.
+FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call FRAMECRC, MOV, AV1, AV1_PARSER) \
+                           += fate-mov-avif-demux-implied-extent
+fate-mov-avif-demux-implied-extent: CMD = stream_demux mov $(TARGET_SAMPLES)/avif/implied_grid.avif "-c:v av1" "-c:v copy -map 0:24" \
+  "-of compact -show_entries stream_group=index,id,nb_streams,type:stream_group_components:stream_group_stream=index,id,width,height"
+
+# avif item with extents across two mdat boxes, read through the root-parsing path.
+FATE_MOV_FFMPEG_SAMPLES-$(call FRAMECRC, MOV, AV1, AV1_PARSER) \
+                           += fate-mov-avif-demux-item-two-mdats
+fate-mov-avif-demux-item-two-mdats: CMD = framecrc -fflags +ignidx -c:v av1 -i $(TARGET_SAMPLES)/mov/mixed_two_mdats.mp4 -map 0:1 -c:v copy
 
 # heic demuxing - still image with 1 item.
 FATE_MOV_FFMPEG_SAMPLES-$(call FRAMECRC, MOV, HEVC, HEVC_PARSER) \
@@ -445,6 +461,21 @@ fate-mov-mp4-mpegh-5_1_4: CMD = stream_demux mp4 $(TARGET_SAMPLES)/mov/mpegh_lay
 FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call REMUX, MP4 MOV) += fate-mov-mp4-mpegh-5_1_4-copy
 fate-mov-mp4-mpegh-5_1_4-copy: CMD = stream_remux mp4 $(TARGET_SAMPLES)/mov/mpegh_layout16.mp4 "" mp4 "" "" "-c:a copy" "-show_entries stream=profile,level,codec_tag_string"
 
+# The 1080-line DV bitstream does not signal progressive frames: keep dvh2.
+FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call ALLYES, FFMPEG FFPROBE MOV_MUXER MOV_DEMUXER FILE_PROTOCOL) += fate-mov-dv-tag-copy-1080p25
+fate-mov-dv-tag-copy-1080p25: CMD = run_with_temp \
+    "$(FFMPEG) -nostdin -v error -i $(TARGET_SAMPLES)/dv/dvcprohd_1080p25.mov -map 0:v -write_tmcd 0 -c copy -f mov -y" \
+    "ffprobe$(PROGSSUF)$(EXESUF) -v error -bitexact -show_data_hash CRC32 \
+    -show_entries packet=size,data_hash:stream=codec_tag_string -of compact=p=0" mov
+
+# The first packet must correct the provisional 60 Hz tag before the moov.
+FATE_MOV_FFMPEG_FFPROBE_SAMPLES-$(call ALLYES, FFMPEG FFPROBE MOV_MUXER MOV_DEMUXER FILE_PROTOCOL) += fate-mov-dv-tag-delay-720p50
+fate-mov-dv-tag-delay-720p50: CMD = run_with_temp \
+    "$(FFMPEG) -nostdin -v error -nofind_stream_info -i $(TARGET_SAMPLES)/dv/dvcprohd_720p50.mov \
+    -map 0:v -write_tmcd 0 -c copy -tag:v dvhp -movflags +delay_moov -f mov -y" \
+    "ffprobe$(PROGSSUF)$(EXESUF) -v error -bitexact -show_data_hash CRC32 \
+    -show_entries packet=size,data_hash:stream=codec_tag_string -of compact=p=0" mov
+
 FATE_SAMPLES_FFMPEG_FFPROBE += $(FATE_MOV_FFMPEG_FFPROBE_SAMPLES-yes)
 FATE_SAMPLES_FFMPEG += $(FATE_MOV_FFMPEG_SAMPLES-yes)
 
@@ -538,7 +569,7 @@ fate-mov-yuv2-color-range: CMD = run_with_temp \
     "$(call MOV_YUV2_GEN,$(MOV_YUV2_SRC))" "$(MOV_YUV2_PROBE) -color_range tv" mov
 
 # The numeric QuickTime keys keep their type through a remux, a non-number
-# stays a string.
+# stays a string. The float32 3effffff (0.49999997) must not round to 0.5.
 FATE_MOV_FFMPEG_FFPROBE-$(call ALLYES, COLOR_FILTER MPEG4_ENCODER MOV_MUXER \
                                       MOV_DEMUXER FRAMECRC_MUXER         \
                                       FILE_PROTOCOL PIPE_PROTOCOL)       \
@@ -550,7 +581,7 @@ tests/data/mov-mdta-numeric.mov: ffmpeg$(PROGSSUF)$(EXESUF) | tests/data
 	    -flags +bitexact -fflags +bitexact -movflags use_metadata_tags \
 	    -metadata com.apple.quicktime.full-frame-rate-playback-intent=1 \
 	    -metadata com.apple.quicktime.live-photo.auto=1 \
-	    -metadata com.apple.quicktime.live-photo.vitality-score=0.918638 \
+	    -metadata com.apple.quicktime.live-photo.vitality-score=0.49999997 \
 	    -metadata com.apple.quicktime.live-photo.vitality-scoring-version=4294967296 \
 	    -metadata com.apple.quicktime.location.role=north \
 	    -metadata com.apple.quicktime.rating.user=-0 \
@@ -835,6 +866,41 @@ tests/data/chpl-utf8.ffmeta: $(SRC_PATH)/tests/chpl-utf8.ffmeta | tests/data
 fate-mov-chpl-utf8: tests/data/chpl-utf8.ffmeta
 FATE_MOV_FFMPEG_FFPROBE-$(call ALLYES, COLOR_FILTER MPEG4_ENCODER FFMETADATA_DEMUXER TGP_MUXER MOV_DEMUXER FILE_PROTOCOL) += fate-mov-chpl-utf8
 fate-mov-chpl-utf8: CMD = run_with_temp "$(FFMPEG) -nostdin -v error -filter_complex color=c=black:s=2x2:r=1 -f ffmetadata -i $(TARGET_PATH)/tests/data/chpl-utf8.ffmeta -map_chapters 0 -frames:v 1 -c:v mpeg4 -threads 1 -flags +bitexact -fflags +bitexact -f 3gp -y" "ffprobe$(PROGSSUF)$(EXESUF) -loglevel error -bitexact -show_chapters" 3gp
+
+# WAV groups several ADPCM blocks in a packet and does not set frame_size;
+# the last packet of an encoded MOV is shorter than its block.
+MOV_ADPCM_SRC = $(foreach C, adpcm_ms adpcm_ima_wav, tests/data/mov-$(C).wav tests/data/mov-$(C).mov)
+$(MOV_ADPCM_SRC): TAG = GEN
+$(MOV_ADPCM_SRC): ffmpeg$(PROGSSUF)$(EXESUF) tests/data/asynth-44100-2.wav | tests/data
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin -v error -fflags +bitexact -i $(TARGET_PATH)/tests/data/asynth-44100-2.wav -t 0.1 -c:a $(patsubst mov-%,%,$(basename $(@F))) -flags +bitexact -fflags +bitexact -y $(TARGET_PATH)/$@
+
+FATE_MOV_FFMPEG_FFPROBE-$(call ALLYES, ADPCM_MS_ENCODER ADPCM_MS_DECODER PCM_S16LE_DECODER PCM_S16LE_ENCODER WAV_MUXER WAV_DEMUXER MOV_MUXER MOV_DEMUXER FRAMECRC_MUXER FILE_PROTOCOL PIPE_PROTOCOL) += fate-mov-adpcm-ms-remux
+FATE_MOV_FFMPEG_FFPROBE-$(call ALLYES, ADPCM_IMA_WAV_ENCODER ADPCM_IMA_WAV_DECODER PCM_S16LE_DECODER PCM_S16LE_ENCODER ARESAMPLE_FILTER WAV_MUXER WAV_DEMUXER MOV_MUXER MOV_DEMUXER FRAMECRC_MUXER FILE_PROTOCOL PIPE_PROTOCOL) += fate-mov-adpcm-ima-wav-remux
+fate-mov-adpcm-ms-remux: tests/data/mov-adpcm_ms.wav
+fate-mov-adpcm-ms-remux: CMD = transcode wav $(TARGET_PATH)/tests/data/mov-adpcm_ms.wav mov "-c:a copy" "-c:a pcm_s16le" "-show_entries stream=codec_name,sample_rate,channels,duration_ts"
+fate-mov-adpcm-ima-wav-remux: tests/data/mov-adpcm_ima_wav.wav
+fate-mov-adpcm-ima-wav-remux: CMD = transcode wav $(TARGET_PATH)/tests/data/mov-adpcm_ima_wav.wav mov "-c:a copy" "-af aresample -c:a pcm_s16le" "-show_entries stream=codec_name,sample_rate,channels,duration_ts"
+
+# A single block with both a leading skip and a short duration.
+tests/data/mov-adpcm_ms-trim-both.mov: TAG = GEN
+tests/data/mov-adpcm_ms-trim-both.mov: ffmpeg$(PROGSSUF)$(EXESUF) tests/data/asynth-44100-1.wav | tests/data
+	$(M)$(TARGET_EXEC) $(TARGET_PATH)/$< -nostdin -v error -i $(TARGET_PATH)/tests/data/asynth-44100-1.wav -c:a adpcm_ms -t 0.02 -movie_timescale 44100 -output_ts_offset -0.002268 -avoid_negative_ts disabled -use_editlist 1 -flags +bitexact -fflags +bitexact -y $(TARGET_PATH)/$@
+
+FATE_MOV_FFMPEG_FFPROBE-$(call REMUX, MOV, WAV_DEMUXER PCM_S16LE_DECODER ADPCM_MS_ENCODER) += fate-mov-adpcm-ms-mov-remux-trim-both
+fate-mov-adpcm-ms-mov-remux-trim-both: tests/data/mov-adpcm_ms-trim-both.mov
+fate-mov-adpcm-ms-mov-remux-trim-both: CMD = transcode mov $(TARGET_PATH)/tests/data/mov-adpcm_ms-trim-both.mov mov "-c:a copy -movie_timescale 44100 -use_editlist 1" "-c copy" "-show_entries stream=duration_ts"
+
+FATE_MOV_FFMPEG_FFPROBE-$(call ALLYES, ADPCM_MS_ENCODER ADPCM_MS_DECODER PCM_S16LE_DECODER PCM_S16LE_ENCODER WAV_DEMUXER MOV_MUXER MOV_DEMUXER FRAMECRC_MUXER FILE_PROTOCOL PIPE_PROTOCOL) += fate-mov-adpcm-ms-mov-remux
+FATE_MOV_FFMPEG_FFPROBE-$(call ALLYES, ADPCM_IMA_WAV_ENCODER ADPCM_IMA_WAV_DECODER PCM_S16LE_DECODER PCM_S16LE_ENCODER ARESAMPLE_FILTER WAV_DEMUXER MOV_MUXER MOV_DEMUXER FRAMECRC_MUXER FILE_PROTOCOL PIPE_PROTOCOL) += fate-mov-adpcm-ima-wav-mov-remux
+fate-mov-adpcm-ms-mov-remux: tests/data/mov-adpcm_ms.mov
+fate-mov-adpcm-ms-mov-remux: CMD = transcode mov $(TARGET_PATH)/tests/data/mov-adpcm_ms.mov mov "-c:a copy" "-c:a pcm_s16le" "-show_entries stream=codec_name,sample_rate,channels,duration_ts"
+fate-mov-adpcm-ima-wav-mov-remux: tests/data/mov-adpcm_ima_wav.mov
+fate-mov-adpcm-ima-wav-mov-remux: CMD = transcode mov $(TARGET_PATH)/tests/data/mov-adpcm_ima_wav.mov mov "-c:a copy" "-af aresample -c:a pcm_s16le" "-show_entries stream=codec_name,sample_rate,channels,duration_ts"
+
+FATE_MOV_FFMPEG_FFPROBE-$(call REMUX, MOV, WAV_DEMUXER PCM_S16LE_DECODER ADPCM_MS_ENCODER) += fate-mov-adpcm-ms-remux-delay-moov
+fate-mov-adpcm-ms-remux-delay-moov: tests/data/mov-adpcm_ms.mov
+fate-mov-adpcm-ms-remux-delay-moov: CMD = transcode mov $(TARGET_PATH)/tests/data/mov-adpcm_ms.mov mov \
+  "-c:a copy -movflags +delay_moov -frag_duration 25000" "-c:a copy" "-show_entries stream=duration_ts"
 
 FATE_FFMPEG += $(FATE_MOV_FFMPEG-yes)
 FATE_FFMPEG_FFPROBE += $(FATE_MOV_FFMPEG_FFPROBE-yes)

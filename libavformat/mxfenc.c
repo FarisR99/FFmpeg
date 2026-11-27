@@ -86,7 +86,6 @@ typedef struct MXFIndexEntry {
 } MXFIndexEntry;
 
 typedef struct j2k_info_t {
-    uint16_t j2k_cap;        ///< j2k required decoder capabilities
     uint16_t j2k_rsiz;       ///< j2k required decoder capabilities (Rsiz)
     uint32_t j2k_xsiz;       ///< j2k width of the reference grid (Xsiz)
     uint32_t j2k_ysiz;       ///< j2k height of the reference grid (Ysiz)
@@ -96,6 +95,7 @@ typedef struct j2k_info_t {
     uint32_t j2k_ytsiz;      ///< j2k height of one reference tile with respect to the reference grid (YTsiz)
     uint32_t j2k_xt0siz;     ///< j2k horizontal offset from the origin of the reference grid to the left side of the first tile (XT0siz)
     uint32_t j2k_yt0siz;     ///< j2k vertical offset from the origin of the reference grid to the left side of the first tile (YT0siz)
+    uint16_t j2k_csiz;       ///< number of coded components (Csiz)
     uint8_t  j2k_comp_desc[12]; ///< j2k components descriptor (Ssiz(i), XRsiz(i), YRsiz(i))
 } j2k_info_t;
 
@@ -116,6 +116,7 @@ typedef struct MXFStreamContext {
     int video_bit_rate;
     int slice_offset;
     int frame_size;          ///< frame size in bytes
+    int element_size;        ///< KAG aligned element size, constant for PCM and CBE
     int seq_closed_gop;      ///< all gops in sequence are closed, used in mpeg-2 descriptor
     int max_gop;             ///< maximum gop size, used by mpeg-2 descriptor
     int b_picture_count;     ///< maximum number of consecutive b pictures, used in mpeg-2 descriptor
@@ -1595,7 +1596,7 @@ static int mxf_write_jpeg2000_subdesc(AVFormatContext *s, AVStream *st)
     MXFStreamContext *sc = st->priv_data;
     AVIOContext *pb = s->pb;
     int64_t pos;
-    const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(st->codecpar->format);
+    unsigned int ncomponents = sc->j2k_info.j2k_csiz;
 
     /* JPEG2000 subdescriptor key */
     avio_write(pb, mxf_jpeg2000_subdescriptor_key, 16);
@@ -1610,10 +1611,10 @@ static int mxf_write_jpeg2000_subdesc(AVFormatContext *s, AVStream *st)
     avio_wb16(pb, sc->j2k_info.j2k_rsiz);
     /* Width of the JPEG2000 reference grid (Xsiz) */
     mxf_write_local_tag(s, 4, 0x8402);
-    avio_wb32(pb, st->codecpar->width);
+    avio_wb32(pb, sc->j2k_info.j2k_xsiz);
     /* Height of the JPEG2000 reference grid (Ysiz) */
     mxf_write_local_tag(s, 4, 0x8403);
-    avio_wb32(pb, st->codecpar->height);
+    avio_wb32(pb, sc->j2k_info.j2k_ysiz);
     /* Horizontal offset from the reference grid origin to the left side of the image area (X0siz) */
     mxf_write_local_tag(s, 4, 0x8404);
     avio_wb32(pb, sc->j2k_info.j2k_x0siz);
@@ -1634,15 +1635,15 @@ static int mxf_write_jpeg2000_subdesc(AVFormatContext *s, AVStream *st)
     avio_wb32(pb, sc->j2k_info.j2k_yt0siz);
     /* Image components number (Csiz) */
     mxf_write_local_tag(s, 2, 0x840A);
-    avio_wb16(pb, pix_desc->nb_components);
+    avio_wb16(pb, ncomponents);
     /* Array of picture components where each component comprises 3 bytes named Ssiz(i) (Pixel bitdepth - 1),
        XRSiz(i) (Horizontal sampling), YRSiz(i) (Vertical sampling). The array of 3-byte groups is preceded
        by the array header comprising a 4-byte value of the number of components followed by a 4-byte
        value of 3. */
-    mxf_write_local_tag(s, 8 + 3*pix_desc->nb_components, 0x840B);
-    avio_wb32(pb, pix_desc->nb_components);
+    mxf_write_local_tag(s, 8 + 3 * ncomponents, 0x840B);
+    avio_wb32(pb, ncomponents);
     avio_wb32(pb, 3);
-    avio_write(pb, sc->j2k_info.j2k_comp_desc, 3*pix_desc->nb_components);
+    avio_write(pb, sc->j2k_info.j2k_comp_desc, 3 * ncomponents);
 
     mxf_update_klv_size(pb, pos);
     return 0;
@@ -2055,6 +2056,13 @@ static unsigned klv_fill_size(uint64_t size)
         return pad & (KAG_SIZE-1);
 }
 
+// KAG-aligned size including the 16-byte key and 4-byte BER length,
+// and the fill KLV that always follows, ST 379-2 8.3.
+static unsigned mxf_element_size(unsigned payload)
+{
+    return FFALIGN(16 + 4 + payload + 16 + 4, KAG_SIZE);
+}
+
 /**
  * Number of slices minus 1. Elements following the VBE picture are in slice 1,
  * there should be no slices if the picture is the last element, ST 377-1 11.1.4.
@@ -2171,21 +2179,24 @@ static void mxf_write_index_table_segment_header(AVFormatContext *s, int64_t sta
         } else { // audio or data track
             avio_w8(pb, 1);
             avio_wb32(pb, element_delta);
-            // each element is KAG aligned and starts with its 16 byte key and 4 byte length
-            element_delta += 16 + 4 + sc->frame_size;
-            element_delta += klv_fill_size(element_delta);
+            element_delta += sc->element_size;
         }
     }
+}
+
+static void mxf_write_fill(AVIOContext *pb, unsigned size)
+{
+    avio_write(pb, klv_fill_key, 16);
+    size -= 16 + 4;
+    klv_encode_ber4_length(pb, size);
+    ffio_fill(pb, 0, size);
 }
 
 static void mxf_write_klv_fill(AVFormatContext *s)
 {
     unsigned pad = klv_fill_size(avio_tell(s->pb));
     if (pad) {
-        avio_write(s->pb, klv_fill_key, 16);
-        pad -= 16 + 4;
-        klv_encode_ber4_length(s->pb, pad);
-        ffio_fill(s->pb, 0, pad);
+        mxf_write_fill(s->pb, pad);
         av_assert1(!(avio_tell(s->pb) & (KAG_SIZE-1)));
     }
 }
@@ -2827,34 +2838,73 @@ static int mxf_parse_ffv1_frame(AVFormatContext *s, AVStream *st, AVPacket *pkt)
     return 1;
 }
 
+/* Position the reader within the first Contiguous Codestream box (T.800, I.5.4). */
+static int mxf_jp2_find_codestream(GetByteContext *g)
+{
+    while (bytestream2_get_bytes_left(g) >= 8) {
+        unsigned int remaining = bytestream2_get_bytes_left(g);
+        uint64_t size = bytestream2_get_be32u(g);
+        uint32_t type = bytestream2_get_be32u(g);
+        unsigned int header_size = 8;
+
+        if (size == 1) {
+            size = bytestream2_get_be64(g);
+            header_size = 16;
+        } else if (!size) {
+            size = remaining;
+        }
+        if (size < header_size || size > remaining)
+            return AVERROR_INVALIDDATA;
+        if (type == MKBETAG('j', 'p', '2', 'c')) {
+            bytestream2_init(g, g->buffer, size - header_size);
+            return 0;
+        }
+        bytestream2_skipu(g, size - header_size);
+    }
+    return AVERROR_INVALIDDATA;
+}
+
 static int mxf_parse_jpeg2000_frame(AVFormatContext *s, AVStream *st, AVPacket *pkt)
 {
     MXFContext *mxf = s->priv_data;
     MXFStreamContext *sc = st->priv_data;
     const AVPixFmtDescriptor *pix_desc = av_pix_fmt_desc_get(st->codecpar->format);
     GetByteContext g;
-    uint32_t j2k_ncomponents;
+    unsigned int j2k_ncomponents;
+    int is_jp2;
 
     if (mxf->header_written)
         return 1;
 
     bytestream2_init(&g,pkt->data,pkt->size);
 
-    while (bytestream2_get_bytes_left(&g) >= 3 && bytestream2_peek_be16(&g) != JPEG2000_SOC)
-        bytestream2_skip(&g, 1);
+    is_jp2 = bytestream2_peek_be64(&g) == 0x0000000c6a502020;
+    if (is_jp2) {
+        if (mxf_jp2_find_codestream(&g) < 0) {
+            av_log(s, AV_LOG_ERROR, "Could not locate JPEG 2000 codestream box\n");
+            return AVERROR_INVALIDDATA;
+        }
+    } else {
+        while (bytestream2_get_bytes_left(&g) >= 3 && bytestream2_peek_be16(&g) != JPEG2000_SOC)
+            bytestream2_skip(&g, 1);
+    }
 
-    if (bytestream2_get_be16u(&g) != JPEG2000_SOC) {
+    if (bytestream2_get_be16(&g) != JPEG2000_SOC) {
         av_log(s, AV_LOG_ERROR, "Mandatory SOC marker is not present\n");
         return AVERROR_INVALIDDATA;
     }
 
     /* Extract useful size information from the SIZ marker */
-    if (bytestream2_get_be16u(&g) != JPEG2000_SIZ) {
+    if (bytestream2_get_be16(&g) != JPEG2000_SIZ) {
         av_log(s, AV_LOG_ERROR, "Mandatory SIZ marker is not present\n");
         return AVERROR_INVALIDDATA;
     }
+    if (bytestream2_get_bytes_left(&g) < 38) {
+        av_log(s, AV_LOG_ERROR, "Truncated JPEG 2000 SIZ header\n");
+        return AVERROR_INVALIDDATA;
+    }
     bytestream2_skip(&g, 2); // Skip Lsiz
-    sc->j2k_info.j2k_cap = bytestream2_get_be16u(&g);
+    sc->j2k_info.j2k_rsiz = bytestream2_get_be16u(&g);
     sc->j2k_info.j2k_xsiz = bytestream2_get_be32u(&g);
     sc->j2k_info.j2k_ysiz = bytestream2_get_be32u(&g);
     sc->j2k_info.j2k_x0siz = bytestream2_get_be32u(&g);
@@ -2864,12 +2914,22 @@ static int mxf_parse_jpeg2000_frame(AVFormatContext *s, AVStream *st, AVPacket *
     sc->j2k_info.j2k_xt0siz = bytestream2_get_be32u(&g);
     sc->j2k_info.j2k_yt0siz = bytestream2_get_be32u(&g);
     j2k_ncomponents = bytestream2_get_be16u(&g);
-    if (j2k_ncomponents != pix_desc->nb_components) {
+    if (!j2k_ncomponents || j2k_ncomponents > sizeof(sc->j2k_info.j2k_comp_desc) / 3) {
+        av_log(s, AV_LOG_ERROR, "Unsupported JPEG 2000 component count: %u\n", j2k_ncomponents);
+        return AVERROR_INVALIDDATA;
+    }
+    /* JP2 component mapping can change the decoded channel count. */
+    if (!is_jp2 && j2k_ncomponents != pix_desc->nb_components) {
         av_log(s, AV_LOG_ERROR, "Incoherence about components image number.\n");
+        return AVERROR_INVALIDDATA;
+    }
+    if (bytestream2_get_bytes_left(&g) < 3 * j2k_ncomponents) {
+        av_log(s, AV_LOG_ERROR, "Truncated JPEG 2000 SIZ component records\n");
         return AVERROR_INVALIDDATA;
     }
     bytestream2_get_bufferu(&g, sc->j2k_info.j2k_comp_desc, 3 * j2k_ncomponents);
 
+    sc->j2k_info.j2k_csiz = j2k_ncomponents;
     sc->frame_size = pkt->size;
     sc->sub_descriptor = JPEG2000SubDescriptor;
 
@@ -3225,15 +3285,19 @@ static int mxf_init(AVFormatContext *s)
 
                 mxf->edit_unit_byte_count = (av_get_bits_per_sample(st->codecpar->codec_id) * st->codecpar->ch_layout.nb_channels) >> 3;
                 sc->index = INDEX_WAV;
-            } else {
-                sc->frame_size = st->codecpar->ch_layout.nb_channels *
-                                 av_rescale_rnd(st->codecpar->sample_rate, mxf->time_base.num, mxf->time_base.den, AV_ROUND_UP) *
-                                 av_get_bits_per_sample(st->codecpar->codec_id) / 8;
             }
             snprintf(bsf_arg, sizeof(bsf_arg), "r=%d/%d", mxf->tc.rate.num, mxf->tc.rate.den);
             ret = ff_stream_add_bitstream_filter(st, "pcm_rechunk", bsf_arg);
             if (ret < 0)
                 return ret;
+            if (!IS_D10(s) && !IS_OPATOM(s)) {
+                // pcm_rechunk checked the channel count and frame size
+                int sample_size = st->codecpar->ch_layout.nb_channels *
+                                  (av_get_bits_per_sample(st->codecpar->codec_id) / 8);
+                sc->frame_size = sample_size * av_rescale_rnd(st->codecpar->sample_rate, mxf->time_base.num,
+                                                              mxf->time_base.den, AV_ROUND_UP);
+                sc->element_size = mxf_element_size(sc->frame_size);
+            }
         } else if (st->codecpar->codec_type == AVMEDIA_TYPE_DATA || st->codecpar->codec_id == AV_CODEC_ID_EIA_608) {
             AVDictionaryEntry* e = av_dict_get(st->metadata, "data_type", NULL, 0);
             if ((e && !strcmp(e->value, "vbi_vanc_smpte_436M")) ||
@@ -3513,8 +3577,12 @@ static void mxf_compute_edit_unit_byte_count(AVFormatContext *s)
         AVStream *st = s->streams[i];
         MXFStreamContext *sc = st->priv_data;
         sc->slice_offset = mxf->edit_unit_byte_count;
-        mxf->edit_unit_byte_count += 16 + 4 + sc->frame_size;
-        mxf->edit_unit_byte_count += klv_fill_size(mxf->edit_unit_byte_count);
+        // ANC packets have no fixed size, keep a KAG of payload plus the fill
+        if (sc->index == INDEX_S436M)
+            sc->element_size = mxf_element_size(KAG_SIZE - 16 - 4);
+        else if (!sc->element_size)
+            sc->element_size = mxf_element_size(sc->frame_size);
+        mxf->edit_unit_byte_count += sc->element_size;
     }
 }
 
@@ -3525,7 +3593,7 @@ static int mxf_write_packet(AVFormatContext *s, AVPacket *pkt)
     AVStream *st = s->streams[pkt->stream_index];
     MXFStreamContext *sc = st->priv_data;
     MXFIndexEntry ie = {0};
-    int err;
+    int err, pad = 0;
 
     if (!mxf->header_written && pkt->stream_index != 0 &&
         !IS_OPATOM(s)) {
@@ -3574,10 +3642,8 @@ static int mxf_write_packet(AVFormatContext *s, AVPacket *pkt)
             return -1;
         }
     } else if (st->codecpar->codec_id == AV_CODEC_ID_JPEG2000) {
-        if (!mxf_parse_jpeg2000_frame(s, st, pkt)) {
-            av_log(s, AV_LOG_ERROR, "could not get jpeg2000 profile\n");
-            return -1;
-        }
+        if ((err = mxf_parse_jpeg2000_frame(s, st, pkt)) < 0)
+            return err;
     }
 
     // codecs without sequence headers: every key frame is a random access point
@@ -3647,6 +3713,22 @@ static int mxf_write_packet(AVFormatContext *s, AVPacket *pkt)
             mxf->body_offset - mxf->index_entries[mxf->edit_units_count-1].offset;
     }
 
+    // keep fill presence consistent across content packages, ST 379-2 8.3,
+    // and pad to a constant element size
+    if (sc->index != INDEX_D10_AUDIO) {
+        unsigned element_size = sc->element_size ? sc->element_size : mxf_element_size(pkt->size);
+        unsigned max_size = element_size - 2 * (16 + 4);
+
+        if (sc->element_size && sc->frame_size)
+            max_size = FFMIN(max_size, sc->frame_size);
+        if ((unsigned)pkt->size > max_size) {
+            av_log(s, AV_LOG_ERROR, "track %d: packet size %d exceeds %u bytes per edit unit\n",
+                   st->index, pkt->size, max_size);
+            return AVERROR(EINVAL);
+        }
+        pad = element_size - 16 - 4 - pkt->size;
+    }
+
     mxf_write_klv_fill(s);
     avio_write(pb, sc->track_essence_element_key, 16); // write key
     if (IS_D10(s) && st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
@@ -3654,7 +3736,8 @@ static int mxf_write_packet(AVFormatContext *s, AVPacket *pkt)
     } else {
         klv_encode_ber4_length(pb, pkt->size); // write length
         avio_write(pb, pkt->data, pkt->size);
-        mxf->body_offset += 16+4+pkt->size + klv_fill_size(16+4+pkt->size);
+        mxf_write_fill(pb, pad);
+        mxf->body_offset += 16 + 4 + (unsigned)pkt->size + pad;
     }
 
     return 0;

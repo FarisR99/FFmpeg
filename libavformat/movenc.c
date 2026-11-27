@@ -42,6 +42,7 @@
 #include "lcevc.h"
 #include "libavcodec/ac3_parser_internal.h"
 #include "libavcodec/dnxhddata.h"
+#include "libavcodec/dv_profile.h"
 #include "libavcodec/flac.h"
 #include "libavcodec/mpegaudiodata.h"
 #include "libavcodec/get_bits.h"
@@ -370,16 +371,7 @@ static int mov_write_iacb_tag(AVFormatContext *s, AVIOContext *pb, MOVTrack *tra
 
 static int mov_write_amr_tag(AVIOContext *pb, MOVTrack *track)
 {
-    avio_wb32(pb, 0x11); /* size */
-    if (track->mode == MODE_MOV) ffio_wfourcc(pb, "samr");
-    else                         ffio_wfourcc(pb, "damr");
-    ffio_wfourcc(pb, "FFMP");
-    avio_w8(pb, 0); /* decoder version */
-
-    avio_wb16(pb, 0x81FF); /* Mode set (all modes for AMR_NB) */
-    avio_w8(pb, 0x00); /* Mode change period (no restriction) */
-    avio_w8(pb, 0x01); /* Frames per sample */
-    return 0x11;
+    return ff_amr_write_config_atom(pb, track->par->codec_id, track->mode == MODE_MOV);
 }
 
 struct eac3_info {
@@ -1173,7 +1165,8 @@ static int mov_write_wave_tag(AVFormatContext *s, AVIOContext *pb, MOVTrack *tra
         mov_write_enda_tag(pb);
     } else if (mov_pcm_be_gt16(track->par->codec_id))  {
         mov_write_enda_tag_be(pb);
-    } else if (track->par->codec_id == AV_CODEC_ID_AMR_NB) {
+    } else if (track->par->codec_id == AV_CODEC_ID_AMR_NB ||
+               track->par->codec_id == AV_CODEC_ID_AMR_WB) {
         mov_write_amr_tag(pb, track);
     } else if (track->par->codec_id == AV_CODEC_ID_AC3) {
         mov_write_ac3_tag(s, pb, track);
@@ -1545,8 +1538,13 @@ static int mov_write_audio_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
                 avio_wb16(pb, 16);
             avio_wb16(pb, track->audio_vbr ? -2 : 0); /* compression ID */
         } else { /* reserved for mp4/3gp */
-            avio_wb16(pb, track->tag == MKTAG('i', 'a', 'm', 'f') ?
-                      0 : track->par->ch_layout.nb_channels);
+            if (track->tag == MKTAG('i', 'a', 'm', 'f'))
+                avio_wb16(pb, 0);
+            else if (track->par->codec_id == AV_CODEC_ID_AMR_NB ||
+                     track->par->codec_id == AV_CODEC_ID_AMR_WB)
+                avio_wb16(pb, 2); /* reserved, 3GPP TS 26.244, 6.5 */
+            else
+                avio_wb16(pb, track->par->ch_layout.nb_channels);
             if (track->par->codec_id == AV_CODEC_ID_FLAC ||
                 track->par->codec_id == AV_CODEC_ID_ALAC) {
                 avio_wb16(pb, track->par->bits_per_raw_sample);
@@ -1577,6 +1575,9 @@ static int mov_write_audio_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
         if (mov_pcm_le_gt16(track->par->codec_id) ||
             mov_pcm_be_gt16(track->par->codec_id))
             avio_wb32(pb, 1); /*  must be 1 for  uncompressed formats */
+        else if (track->par->codec_id == AV_CODEC_ID_AMR_NB ||
+                 track->par->codec_id == AV_CODEC_ID_AMR_WB)
+            avio_wb32(pb, track->par->codec_id == AV_CODEC_ID_AMR_WB ? 320 : 160);
         else
             avio_wb32(pb, track->par->frame_size); /* Samples per packet */
         avio_wb32(pb, track->sample_size / track->par->ch_layout.nb_channels); /* Bytes per packet */
@@ -1589,6 +1590,7 @@ static int mov_write_audio_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
          track->par->codec_id == AV_CODEC_ID_AC3           ||
          track->par->codec_id == AV_CODEC_ID_EAC3          ||
          track->par->codec_id == AV_CODEC_ID_AMR_NB        ||
+         track->par->codec_id == AV_CODEC_ID_AMR_WB        ||
          track->par->codec_id == AV_CODEC_ID_ALAC          ||
          track->par->codec_id == AV_CODEC_ID_ADPCM_MS      ||
          track->par->codec_id == AV_CODEC_ID_ADPCM_IMA_WAV ||
@@ -1603,7 +1605,8 @@ static int mov_write_audio_tag(AVFormatContext *s, AVIOContext *pb, MOVMuxContex
     else if (track->tag == MKTAG('i','a','m','f'))
         ret = mov_write_iacb_tag(mov->fc, pb, track);
 #endif
-    else if (track->par->codec_id == AV_CODEC_ID_AMR_NB)
+    else if (track->par->codec_id == AV_CODEC_ID_AMR_NB ||
+             track->par->codec_id == AV_CODEC_ID_AMR_WB)
         ret = mov_write_amr_tag(pb, track);
     else if (track->par->codec_id == AV_CODEC_ID_AC3)
         ret = mov_write_ac3_tag(s, pb, track);
@@ -1973,9 +1976,34 @@ static int mov_write_dpxe_tag(AVIOContext *pb, MOVTrack *track)
     return 0;
 }
 
+static int mov_is_dv_720_tag(unsigned tag)
+{
+    return tag == MKTAG('d','v','h','q') ||
+           tag == MKTAG('d','v','h','p') ||
+           tag == MKTAG('d','v','h','4');
+}
+
 static int mov_get_dv_codec_tag(AVFormatContext *s, MOVTrack *track)
 {
-    int tag;
+    int tag, rate_50hz;
+    /* The coded DV system can differ from the presentation frame rate. */
+    AVRational rate = track->par->framerate;
+    int coded_rate = rate.num && rate.den;
+    int64_t fps;
+    int progressive = track->par->field_order == AV_FIELD_PROGRESSIVE;
+
+    if (!coded_rate)
+        rate = track->st->avg_frame_rate;
+    if (!rate.num || !rate.den)
+        rate = av_inv_q(track->st->time_base);
+    /* average frame rates may be slightly off */
+    fps = rate.den > 0 ? av_rescale(rate.num, 1, rate.den) : 0;
+    rate_50hz = fps == 25 || fps == 50;
+
+    /* the 1080-line bitstream does not signal progressive frames */
+    if (track->par->field_order == AV_FIELD_UNKNOWN)
+        progressive = track->par->codec_tag == MKTAG('d','v','h','2') ||
+                      track->par->codec_tag == MKTAG('d','v','h','3');
 
     if (track->par->width == 720) { /* SD */
         if (track->par->height == 480) { /* NTSC */
@@ -1985,11 +2013,16 @@ static int mov_get_dv_codec_tag(AVFormatContext *s, MOVTrack *track)
         else if (track->par->format == AV_PIX_FMT_YUV420P) tag = MKTAG('d','v','c','p');
         else                                                tag = MKTAG('d','v','p','p');
     } else if (track->par->height == 720) { /* HD 720 line */
-        if  (track->st->time_base.den == 50)                tag = MKTAG('d','v','h','q');
+        if (!coded_rate && mov_is_dv_720_tag(track->par->codec_tag))
+            tag = track->par->codec_tag;
+        else if (rate_50hz)                                 tag = MKTAG('d','v','h','q');
         else                                                tag = MKTAG('d','v','h','p');
     } else if (track->par->height == 1080) { /* HD 1080 line */
-        if  (track->st->time_base.den == 25)                tag = MKTAG('d','v','h','5');
-        else                                                tag = MKTAG('d','v','h','6');
+        if  (track->par->width == 1440 ||
+             (track->par->width != 1280 && rate_50hz))
+            tag = progressive ? MKTAG('d','v','h','2') : MKTAG('d','v','h','5');
+        else
+            tag = progressive ? MKTAG('d','v','h','3') : MKTAG('d','v','h','6');
     } else {
         av_log(s, AV_LOG_ERROR, "unsupported height for dv codec\n");
         return 0;
@@ -7364,6 +7397,13 @@ static int mov_cts_out_of_range(const MOVMuxContext *mov, const AVPacket *pkt)
     return delta != (int32_t)delta;
 }
 
+static int mov_packet_uses_stbl(const MOVMuxContext *mov)
+{
+    return !(mov->flags & FF_MOV_FLAG_FRAGMENT) ||
+           mov->flags & FF_MOV_FLAG_HYBRID_FRAGMENTED ||
+           (!mov->moov_written && !(mov->flags & FF_MOV_FLAG_EMPTY_MOOV));
+}
+
 int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
 {
     MOVMuxContext *mov = s->priv_data;
@@ -7373,7 +7413,8 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
     AVProducerReferenceTime *prft;
     unsigned int samples_in_chunk = 0;
     int64_t duration;
-    int size = pkt->size, ret = 0, offset = 0;
+    int size = pkt->size, ret = 0, offset = 0, coded_samples = 0;
+    int64_t discard = 0;
     size_t prft_size;
     uint8_t *reformatted_data = NULL;
 
@@ -7394,6 +7435,20 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
     if (mov_cts_out_of_range(mov, pkt)) {
         av_log(s, AV_LOG_WARNING, "pts/dts pair unsupported\n");
         return AVERROR_PATCHWELCOME;
+    }
+
+    /* The first frame gives the 720-line DV family. */
+    if (par->codec_id == AV_CODEC_ID_DVVIDEO && par->height == 720 &&
+        !trk->entry && !mov->moov_written && trk->mode == MODE_MOV &&
+        s->strict_std_compliance >= FF_COMPLIANCE_NORMAL &&
+        mov_is_dv_720_tag(trk->tag)) {
+        const AVDVProfile *sys = av_dv_frame_profile(NULL, pkt->data, pkt->size);
+        if (sys && sys->height == 720) {
+            if (sys->dsf)
+                trk->tag = MKTAG('d','v','h','q');
+            else if (trk->tag != MKTAG('d','v','h','4'))
+                trk->tag = MKTAG('d','v','h','p');
+        }
     }
 
     if (mov->flags & FF_MOV_FLAG_FRAGMENT || mov->mode == MODE_AVIF) {
@@ -7420,23 +7475,19 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
         }
     }
 
-    if (par->codec_id == AV_CODEC_ID_AMR_NB) {
-        /* We must find out how many AMR blocks there are in one packet */
-        static const uint16_t packed_size[16] =
-            {13, 14, 16, 18, 20, 21, 27, 32, 6, 0, 0, 0, 0, 0, 0, 1};
-        int len = 0;
-
-        while (len < size && samples_in_chunk < 100) {
-            len += packed_size[(pkt->data[len] >> 3) & 0x0F];
-            samples_in_chunk++;
+    if (par->codec_id == AV_CODEC_ID_ADPCM_MS ||
+        par->codec_id == AV_CODEC_ID_ADPCM_IMA_WAV) {
+        /* packets of whole blocks of block_align bytes */
+        int64_t blocks = size == trk->sample_size ? 1 : size / trk->sample_size;
+        if (!size || size != blocks * trk->sample_size) {
+            av_log(s, AV_LOG_ERROR, "Packet size %d is not a multiple of the block align %ld\n",
+                   size, trk->sample_size);
+            return AVERROR_INVALIDDATA;
         }
-        if (samples_in_chunk > 1) {
-            av_log(s, AV_LOG_ERROR, "fatal error, input is not a single packet, implement a AVParser for it\n");
-            return -1;
-        }
-    } else if (par->codec_id == AV_CODEC_ID_ADPCM_MS ||
-               par->codec_id == AV_CODEC_ID_ADPCM_IMA_WAV) {
-        samples_in_chunk = trk->par->frame_size;
+        if (par->frame_size <= 0 || blocks * par->frame_size > INT_MAX)
+            return AVERROR_INVALIDDATA;
+        coded_samples    = blocks * par->frame_size;
+        samples_in_chunk = coded_samples;
     } else if (trk->sample_size)
         samples_in_chunk = size / trk->sample_size;
     else
@@ -7747,18 +7798,40 @@ int ff_mov_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     sd = av_packet_side_data_get(pkt->side_data, pkt->side_data_elems, AV_PKT_DATA_SKIP_SAMPLES);
-    if (sd && sd->size >= 10 && trk->par->frame_size) {
-        int coded_samples = av_get_audio_frame_duration2(trk->par, pkt->size);
+    if (sd && sd->size >= 10 && trk->par->frame_size)
+        discard = AV_RL32(sd->data + 4);
+    else
+        sd = NULL;
+
+    if (coded_samples) {
+        if (!sd && pkt->duration == coded_samples &&
+            !av_cmp_q(trk->st->time_base, (AVRational){ 1, par->sample_rate }))
+            coded_samples = 0; /* full packet, nothing to trim */
+        else if (!discard && pkt->duration > 0)
+            /* a last packet of whole blocks may be shorter than its blocks */
+            discard = FFMAX(coded_samples - av_rescale_q(pkt->duration, trk->st->time_base,
+                                                         (AVRational){ 1, par->sample_rate }), 0);
+    } else if (sd) {
+        coded_samples = av_get_audio_frame_duration2(par, pkt->size);
         if (coded_samples <= 0)
-            coded_samples = trk->par->frame_size;
+            coded_samples = par->frame_size;
+    }
+    if (coded_samples > 0) {
+        /* fragments have an open-ended edit list, their durations carry the end trim */
+        int adpcm_fragment = (par->codec_id == AV_CODEC_ID_ADPCM_MS ||
+                              par->codec_id == AV_CODEC_ID_ADPCM_IMA_WAV) &&
+                             !mov_packet_uses_stbl(mov);
+
         duration = FFMAX(av_rescale_q(coded_samples, (AVRational){ 1, trk->par->sample_rate },
                                       trk->st->time_base), pkt->duration);
-        if (mov->use_editlist)
+        if (mov->use_editlist && !adpcm_fragment)
             pkt->duration = duration;
-        duration -= av_rescale_q(AV_RL32(sd->data + 4), (AVRational){ 1, trk->par->sample_rate },
+        duration -= av_rescale_q(discard, (AVRational){ 1, trk->par->sample_rate },
                                  trk->st->time_base);
         if (duration < 0)
             return AVERROR_INVALIDDATA;
+        if (adpcm_fragment)
+            pkt->duration = duration;
     } else
         duration = pkt->duration;
 
@@ -8104,6 +8177,16 @@ static int mov_write_packet(AVFormatContext *s, AVPacket *pkt)
     }
 
     trk = s->streams[pkt->stream_index]->priv_data;
+
+    /* Reject unsupported AMR blocks before the packet can change a fragment. */
+    if (pkt->size && (trk->par->codec_id == AV_CODEC_ID_AMR_NB ||
+                      trk->par->codec_id == AV_CODEC_ID_AMR_WB)) {
+        int ret = ff_amr_check_frame_block(trk->par->codec_id, pkt->data, pkt->size, 1);
+        if (ret < 0) {
+            av_log(s, AV_LOG_ERROR, "Invalid or unsupported AMR packet\n");
+            return ret;
+        }
+    }
 
 #if CONFIG_IAMFENC
     if (trk->iamf) {
@@ -9084,17 +9167,35 @@ static int mov_init(AVFormatContext *s)
             }
         } else if (st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO) {
             track->timescale = st->codecpar->sample_rate;
-            if (!st->codecpar->frame_size && !av_get_bits_per_sample(st->codecpar->codec_id)) {
+            if (st->codecpar->codec_id == AV_CODEC_ID_AMR_NB ||
+                st->codecpar->codec_id == AV_CODEC_ID_AMR_WB) {
+                if (st->codecpar->ch_layout.nb_channels != 1) {
+                    av_log(s, AV_LOG_ERROR, "track %d: AMR requires mono audio\n", i);
+                    return AVERROR(EINVAL);
+                }
+                /* One frame per sample, sized by its frame type */
+                track->audio_vbr = 1;
+            } else if (!st->codecpar->frame_size && !av_get_bits_per_sample(st->codecpar->codec_id)) {
                 av_log(s, AV_LOG_WARNING, "track %d: codec frame size is not set\n", i);
                 track->audio_vbr = 1;
             }else if (st->codecpar->codec_id == AV_CODEC_ID_ADPCM_MS ||
                      st->codecpar->codec_id == AV_CODEC_ID_ADPCM_IMA_WAV ||
                      st->codecpar->codec_id == AV_CODEC_ID_ILBC){
-                if (!st->codecpar->block_align) {
+                if (st->codecpar->block_align <= 0) {
                     av_log(s, AV_LOG_ERROR, "track %d: codec block align is not set for adpcm\n", i);
                     return AVERROR(EINVAL);
                 }
                 track->sample_size = st->codecpar->block_align;
+                if (!st->codecpar->frame_size) {
+                    st->codecpar->frame_size =
+                        av_get_audio_frame_duration2(st->codecpar, st->codecpar->block_align);
+                    if (!st->codecpar->frame_size) {
+                        av_log(s, AV_LOG_ERROR, "track %d: cannot derive samples per block "
+                               "(block align %d, coded bits per sample %d)\n", i,
+                               st->codecpar->block_align, st->codecpar->bits_per_coded_sample);
+                        return AVERROR_INVALIDDATA;
+                    }
+                }
             }else if (st->codecpar->frame_size > 1){ /* assume compressed audio */
                 track->audio_vbr = 1;
             }else{
